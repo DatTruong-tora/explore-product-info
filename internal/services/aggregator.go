@@ -3,11 +3,13 @@ package services
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"io"
 	"net/url"
 	"os"
 	"strings"
@@ -20,7 +22,7 @@ import (
 // Shared HTTP client to avoid connection bottlenecks.
 var httpClient = &http.Client{Timeout: 60 * time.Second}
 
-// 1. Call the real UPC API.
+// 1. Call the UPC API.
 func fetchSeedData(ctx context.Context, upc string) (*models.UPCResponse, error) {
 	reqURL := fmt.Sprintf("https://api.upcitemdb.com/prod/trial/lookup?upc=%s", upc)
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
@@ -44,11 +46,10 @@ func fetchSeedData(ctx context.Context, upc string) (*models.UPCResponse, error)
 		return nil, err
 	}
 
-	fmt.Println("data", data)
 	return &data, nil
 }
 
-// 2. Call the real USPTO API.
+// 2. Call the USPTO API.
 func fetchPatentData(ctx context.Context, brand string) (*models.PatentsViewResponse, error) {
 	usptoKey := os.Getenv("USPTO_API_KEY")
 	if usptoKey == "" {
@@ -59,10 +60,10 @@ func fetchPatentData(ctx context.Context, brand string) (*models.PatentsViewResp
 	reqURL := fmt.Sprintf("https://api.uspto.gov/api/v1/patent/applications/search?searchText=%s", url.QueryEscape(searchText))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if (err != nil) {
+	if err != nil {
 		return nil, err
 	}
-	
+
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-API-Key", strings.TrimSpace(usptoKey))
 
@@ -85,56 +86,60 @@ func fetchPatentData(ctx context.Context, brand string) (*models.PatentsViewResp
 	return &data, nil
 }
 
-// 3. Call the real LLM API (Gemini) for synthesis.
-func synthesizeWithLLM(ctx context.Context, seedData *models.UPCResponse, patentData *models.PatentsViewResponse) (*models.FinalProductInfo, error) {
+// 3. Call the  LLM API (Gemini) for synthesis.
+func generateRandomID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return "PRD-" + hex.EncodeToString(b)
+}
+
+func synthesizeWithLLM(ctx context.Context, description string, patentData *models.PatentsViewResponse) (*models.LLMAnalysisResult, error) {
 	apiKey := os.Getenv("GEMINI_API_KEY")
-	
+
 	apiKey = strings.TrimSpace(apiKey)
-	apiKey = strings.Trim(apiKey, `"'`) 
+	apiKey = strings.Trim(apiKey, `"'`)
 
 	if apiKey == "" {
 		return nil, fmt.Errorf("missing GEMINI_API_KEY environment variable")
 	}
 
-	seedJSON, _ := json.Marshal(seedData)
+	// Only send what the LLM really needs to analyze
 	patentJSON, _ := json.Marshal(patentData)
 
-	// Strict prompt that forces the LLM to extract Description and Features and map related patents.
-	prompt := fmt.Sprintf(`You are an AI specializing in technical analysis and intellectual property. Analyze the Seed Data (Product) and Patent Data below.
-	MANDATORY REQUIREMENT: Return ONLY one valid JSON string. Do not use markdown blocks (such as `+"```json"+`).
+	prompt := fmt.Sprintf(`You are an AI specializing in intellectual property and product analysis. 
+	Analyze the Product Description, Features, and Patent Data below.
+	Notice: The Product Description might be truncated or cut off at the end. 
+
+	MANDATORY REQUIREMENT: Return ONLY a valid JSON string matching the exact schema. No markdown blocks.
 
 	Required JSON schema:
 	{
-		"product_id": "Generate a random ID",
-		"product_identity": {"title": "", "brand": "", "model": "", "upc": ""},
-		"product_description": "Extract the detailed description from Seed Data",
-		"product_features": ["Feature 1", "Feature 2"],
-		"core_invention_idea": "Summarize the core invention idea",
-		"technical_specifications": {"key": "value"},
+		"polished_description": "Read the raw Product Description. If it is cut off, complete the final sentence gracefully based on context. Rewrite it to be a professional, fully complete paragraph.",
+		"core_invention_idea": "Summarize the core invention idea based on the features and patents",
 		"intellectual_property_analysis": {
-			"associated_patents": ["Patent number 1"],
+			"associated_patents": ["Patent applicationNumberText"],
 			"claim_charts": [
-				{"patent_claim": "", "product_feature_mapped": "", "invalidity_search_relevance": "High/Medium/Low"}
+				{"patent_claim": "Claim or concept from patent", "product_feature_mapped": "Feature mapped", "invalidity_search_relevance": "High/Medium/Low"}
 			]
 		}
 	}
 
-	Seed Data: %s
-	Patent Data (Use up to the 2 most relevant patents): %s`, string(seedJSON), string(patentJSON))
+	Product Description: %s
+	Patent Data: %s`, description, string(patentJSON))
 
 	reqBody := map[string]interface{}{
 		"contents": []map[string]interface{}{
 			{"parts": []map[string]string{{"text": prompt}}},
 		},
 		"generationConfig": map[string]interface{}{
-			"response_mime_type": "application/json", // Force Gemini to return valid JSON.
+			"response_mime_type": "application/json",
 		},
 	}
 	bodyBytes, _ := json.Marshal(reqBody)
 
 	// Use the active model endpoint.
 	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey
-	
+
 	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("could not create Gemini request: %v", err)
@@ -162,57 +167,131 @@ func synthesizeWithLLM(ctx context.Context, seedData *models.UPCResponse, patent
 		return nil, fmt.Errorf("Gemini returned no results")
 	}
 
-	rawJSONString := geminiResp.Candidates[0].Content.Parts[0].Text
-	rawJSONString = strings.TrimPrefix(rawJSONString, "```json\n")
-	rawJSONString = strings.TrimSuffix(rawJSONString, "\n```")
+	rawJSONString := strings.TrimSuffix(strings.TrimPrefix(geminiResp.Candidates[0].Content.Parts[0].Text, "```json\n"), "\n```")
 
-	var finalData models.FinalProductInfo
-	if err := json.Unmarshal([]byte(rawJSONString), &finalData); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON from LLM: %v", err)
+	var analysis models.LLMAnalysisResult
+	if err := json.Unmarshal([]byte(rawJSONString), &analysis); err != nil {
+		return nil, err
 	}
 
-	return &finalData, nil
+	return &analysis, nil
 }
 
-// 4. Orchestrator: wrap the full flow.
+// 4. Orchestrator: Manual mapping here
 func AggregateProductData(upcCode string) (*models.FinalProductInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second) // Increase timeout for LLM processing.
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	log.Printf("[1] Starting UPC data lookup for code %s...", upcCode)
+	// 4.1. Fetch the product data from UPC (Contains links, prices, descriptions)
 	seedData, err := fetchSeedData(ctx, upcCode)
 	if err != nil || len(seedData.Items) == 0 {
-		return nil, fmt.Errorf("product information not found or UPC API call failed: %v", err)
+		return nil, fmt.Errorf("UPC lookup failed: %v", err)
 	}
-	brand := seedData.Items[0].Brand
-	log.Printf("=> Found product: %s (Brand: %s)", seedData.Items[0].Title, brand)
+	item := seedData.Items[0]
 
-	log.Printf("[2] Fetching patent data for %s...", brand)
+	// 4.2. Initialize the return object and manually map the Seed data
+	finalResult := &models.FinalProductInfo{
+		ProductID: generateRandomID(),
+		ProductIdentity: models.ProductIdentity{
+			Title: item.Title,
+			Brand: item.Brand,
+			Model: item.Model,
+			UPC:   upcCode,
+		},
+		Description: item.Description,
+		TechSpecs:   make(map[string]string),
+		CommercialDetails: models.CommercialInfo{
+			Manufacturer: item.Brand,
+			Marketplaces: make([]models.Marketplace, 0),
+		},
+	}
+
+	// --> Map commercial data (Links, Average Price) from the Offers array <---
+	var totalPrice float64
+	var offerCount int
+	for _, offer := range item.Offers {
+		finalResult.CommercialDetails.Marketplaces = append(finalResult.CommercialDetails.Marketplaces, models.Marketplace{
+			StoreName:   offer.Merchant,
+			Price:       offer.Price,
+			Currency:    offer.Currency,
+			ProductLink: offer.Link,
+		})
+		totalPrice += offer.Price
+		offerCount++
+	}
+
+	// Calculate the average price
+	if offerCount > 0 {
+		finalResult.CommercialDetails.AveragePrice = totalPrice / float64(offerCount)
+	}
+
+	// 4.3. Fetch patent data
 	var wg sync.WaitGroup
 	var patentData *models.PatentsViewResponse
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		data, err := fetchPatentData(ctx, brand)
-		if err != nil {
-			log.Printf("=> Warning: failed to fetch patent data: %v", err)
-			return
+		data, err := fetchPatentData(ctx, item.Brand)
+		if err == nil {
+			patentData = data
+		} else {
+			log.Printf("Warning: patent fetch failed: %v", err)
 		}
-		patentData = data
-		log.Printf("=> Successfully fetched patent data for %s", brand)
 	}()
-
 	wg.Wait()
 
-	log.Println("[3] Starting LLM synthesis...")
-	finalResult, err := synthesizeWithLLM(ctx, seedData, patentData)
+	// 4.4. Manual mapping of patent data to technical specs
+	if patentData != nil && len(patentData.PatentFileWrapperDataBag) > 0 {
+		foundManufacturer := false
+		foundCountry := false
+		foundFilingDate := false
+		foundInventor := false
+
+		for _, patentItem := range patentData.PatentFileWrapperDataBag {
+			meta := patentItem.ApplicationMetaData
+
+			if !foundFilingDate && meta.FilingDate != "" {
+				finalResult.TechSpecs["patent_filing_date"] = meta.FilingDate
+				foundFilingDate = true
+			}
+
+			if !foundInventor && meta.FirstInventorName != "" {
+				finalResult.TechSpecs["key_inventor"] = meta.FirstInventorName
+				foundInventor = true
+			}
+
+			for _, applicant := range meta.ApplicantBag {
+				if !foundManufacturer && applicant.ApplicantNameText != "" {
+					finalResult.CommercialDetails.Manufacturer = applicant.ApplicantNameText
+					foundManufacturer = true
+				}
+
+				for _, address := range applicant.CorrespondenceAddressBag {
+					if !foundCountry && address.CountryName != "" {
+						finalResult.CommercialDetails.CountryOfOrigin = address.CountryName
+						foundCountry = true
+					}
+				}
+			}
+
+			if foundFilingDate && foundInventor && foundManufacturer && foundCountry {
+				break
+			}
+		}
+	}
+
+	// 4.5. Call LLM to do the complex part (Only Core Idea and Claim Charts)
+	log.Println("[3] Starting LLM synthesis for IP Analysis...")
+	llmAnalysis, err := synthesizeWithLLM(ctx, item.Description, patentData)
 	if err != nil {
 		return nil, fmt.Errorf("synthesis process failed: %v", err)
 	}
 
-	// Ensure the input UPC is present in the final response.
-	finalResult.ProductIdentity.UPC = upcCode
+	// 4.6. Merge the result from LLM into the Struct
+	finalResult.Description = llmAnalysis.PolishedDescription
+	finalResult.CoreInventionIdea = llmAnalysis.CoreInventionIdea
+	finalResult.IPAnalysis = llmAnalysis.IPAnalysis
 
 	return finalResult, nil
 }

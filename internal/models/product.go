@@ -4,11 +4,25 @@ package models
 type FinalProductInfo struct {
 	ProductID         string            `json:"product_id"`
 	ProductIdentity   ProductIdentity   `json:"product_identity"`
+	CommercialDetails CommercialInfo    `json:"commercial_details"` // Thêm cục này vào
 	Description       string            `json:"product_description"`
-	Features          []string          `json:"product_features"`
 	CoreInventionIdea string            `json:"core_invention_idea"`
 	TechSpecs         map[string]string `json:"technical_specifications"`
 	IPAnalysis        IPAnalysisData    `json:"intellectual_property_analysis"`
+}
+
+type CommercialInfo struct {
+	Manufacturer    string        `json:"manufacturer"`
+	CountryOfOrigin string        `json:"country_of_origin"`
+	AveragePrice    float64       `json:"average_price"`
+	Marketplaces    []Marketplace `json:"marketplaces"`
+}
+
+type Marketplace struct {
+	StoreName   string  `json:"store_name"`
+	Price       float64 `json:"price"`
+	Currency    string  `json:"currency"`
+	ProductLink string  `json:"product_link"`
 }
 
 type ProductIdentity struct {
@@ -32,12 +46,20 @@ type ClaimChart struct {
 // 2. Struct for raw data returned by UPCitemdb.
 type UPCResponse struct {
 	Items []struct {
-		Title       string   `json:"title"`
-		Description string   `json:"description"`
-		Brand       string   `json:"brand"`
-		Model       string   `json:"model"`
-		Features    []string `json:"features"` // The real API returns a features array.
+		Title       string  `json:"title"`
+		Description string  `json:"description"`
+		Brand       string  `json:"brand"`
+		Model       string  `json:"model"`
+		Offers      []Offer `json:"offers"`
 	} `json:"items"`
+}
+
+type Offer struct {
+	Merchant string  `json:"merchant"`
+	Domain   string  `json:"domain"`
+	Price    float64 `json:"price"`
+	Currency string  `json:"currency"`
+	Link     string  `json:"link"`
 }
 
 // 3. Struct for raw data returned by USPTO.
@@ -53,9 +75,21 @@ type PatentItem struct {
 }
 
 type ApplicationMetaData struct {
-	InventionTitle        string `json:"inventionTitle"`
-	ApplicationStatusDate string `json:"applicationStatusDate"`
-	FirstInventorName     string `json:"firstInventorName"`
+	InventionTitle    string         `json:"inventionTitle"`
+	FilingDate        string         `json:"filingDate"`        // filing date
+	FirstInventorName string         `json:"firstInventorName"` // first inventor name
+	ApplicantBag      []ApplicantBag `json:"applicantBag"`      // applicant bag
+}
+
+type ApplicantBag struct {
+	ApplicantNameText        string       `json:"applicantNameText"`
+	CorrespondenceAddressBag []AddressBag `json:"correspondenceAddressBag"`
+}
+
+type AddressBag struct {
+	CityName             string `json:"cityName"`
+	GeographicRegionName string `json:"geographicRegionName"`
+	CountryName          string `json:"countryName"`
 }
 
 // 4. Struct for raw data returned by the Gemini API.
@@ -67,4 +101,11 @@ type GeminiResponse struct {
 			} `json:"parts"`
 		} `json:"content"`
 	} `json:"candidates"`
+}
+
+// Struct for the LLM analysis result
+type LLMAnalysisResult struct {
+	PolishedDescription string         `json:"polished_description"`
+	CoreInventionIdea   string         `json:"core_invention_idea"`
+	IPAnalysis          IPAnalysisData `json:"intellectual_property_analysis"`
 }
