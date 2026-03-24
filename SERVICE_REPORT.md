@@ -1,201 +1,413 @@
 # Product Insight API Service Report
 
-## 1. General Overview
+## 1. Executive Summary
 
-`product-insight-api` is a small Go-based HTTP service that accepts a UPC code, fetches product data from an external UPC source, looks up patent-related information from the USPTO API using the product brand, and then sends both datasets to Gemini to synthesize a structured product-and-IP analysis response.
+`product-insight-api` is a Go-based orchestration service that accepts a UPC code, retrieves product data from `UPCitemdb`, retrieves patent application data from the `USPTO` API, and then uses `Gemini` to enrich the result with higher-level analysis. The final output is a single normalized JSON response designed for downstream consumption.
 
-At a high level, the service acts as an orchestration layer between:
+The key design idea in the current implementation is a hybrid pipeline:
 
-- A client calling the local API
-- A product lookup API
-- A patent search API
-- A large language model used for synthesis
+- deterministic mapping for fields that can be trusted directly from upstream APIs
+- AI-based synthesis for fields that require interpretation, summarization, or reasoning
 
-The main business goal is to transform raw external data into a normalized response that is easier for downstream consumers to use.
+This design allows the service to stay reliable for structured fields such as identity, pricing, and marketplace links, while also generating more advanced IP-oriented insights from patent data.
 
-## 2. Project Structure
+## 2. Objective of the Service
 
-The current project is intentionally compact and organized into a few clear layers:
+The service solves a multi-source data problem. A single external source is not enough to generate a complete product insight report:
+
+- `UPCitemdb` provides product-facing commercial data
+- `USPTO` provides legal and technical patent application data
+- `Gemini` turns raw or incomplete text into a cleaner analysis layer
+
+The service therefore acts as an aggregation and enrichment layer that:
+
+1. gets raw product data
+2. gets patent-related data
+3. analyzes the data
+4. merges the results into one response payload
+
+## 3. Current Project Structure
+
+The current codebase is compact and divided into a few focused parts:
 
 - `cmd/api/main.go`
-  Starts the HTTP server, loads environment variables, and registers routes.
+  Application entry point. Loads environment variables, creates the Gin router, registers routes, and starts the server.
 
 - `internal/handlers/product_handler.go`
-  Handles the incoming HTTP request, validates the required query parameter, and returns JSON responses.
+  HTTP layer. Validates the incoming request and delegates all business logic to the service layer.
 
 - `internal/services/aggregator.go`
-  Contains the core orchestration logic:
-  fetch product data, fetch patent data, call Gemini, and assemble the final response.
+  Core orchestration layer. Fetches external data, performs manual mapping, calls Gemini, and merges all outputs into the final response.
 
 - `internal/models/product.go`
-  Defines the response structures for:
-  - the normalized API response
-  - UPC source data
-  - USPTO source data
-  - Gemini response data
+  Shared data contracts for:
+  - normalized API output
+  - UPC upstream response
+  - USPTO upstream response
+  - Gemini response envelope
+  - LLM analysis result
 
-- `.env`
-  Stores required runtime secrets locally:
-  - `GEMINI_API_KEY`
-  - `USPTO_API_KEY`
+- `.air.toml`
+  Local live-reload development configuration.
 
 - `go.mod` / `go.sum`
-  Define the Go module and locked dependency versions.
+  Go module definition and dependency lock information.
 
-## 3. What the Service Does
+## 4. Technologies Used and Why They Were Chosen
 
-The service exposes one HTTP endpoint:
+### 4.1 Go
+
+Go is a strong fit for this service because:
+
+- the application is network-heavy and IO-bound
+- Go has excellent built-in support for HTTP clients and servers
+- `context.Context` gives clean timeout and cancellation control
+- the concurrency model is simple and effective for service orchestration
+- the compiled binary is lightweight and easy to run locally
+
+### 4.2 Gin
+
+Gin is used as the HTTP framework because it offers:
+
+- a lightweight routing layer
+- easy JSON responses
+- built-in middleware for logging and panic recovery
+- simple route grouping for versioned APIs
+
+This is appropriate for the current scope because the service currently exposes a small API surface and does not need a more complex framework.
+
+### 4.3 godotenv
+
+`godotenv` is used to load local configuration from `.env`. This is useful because the service depends on external API keys and local development is simpler when those keys can be loaded automatically.
+
+### 4.4 UPCitemdb
+
+This API is used as the primary product lookup source. It provides:
+
+- product title
+- brand
+- model
+- offers
+- merchant links
+- prices
+- currency
+- raw product description
+
+This data is used as the commercial and identity foundation of the final response.
+
+### 4.5 USPTO API
+
+The USPTO API is used to retrieve patent application data based on the product brand. It provides:
+
+- application records
+- filing metadata
+- inventor metadata
+- applicant metadata
+- correspondence address metadata
+
+This data is important because it extends the service beyond basic product lookup and enables intellectual property analysis.
+
+### 4.6 Gemini
+
+Gemini is used for the analytical layer rather than the raw data retrieval layer. In the current version, Gemini is responsible for:
+
+- polishing and completing the product description
+- summarizing the core invention idea
+- generating intellectual property analysis
+- building claim chart style mappings
+
+
+## 5. API Surface
+
+The service currently exposes one endpoint:
 
 - `GET /api/v1/product?upc=<UPC_CODE>`
 
-Its purpose is to:
+Expected behavior:
 
-1. Accept a UPC code from the client.
-2. Query a UPC database API to identify the product.
-3. Extract the product brand from the UPC result.
-4. Query the USPTO API for patent/application data related to that brand.
-5. Send the combined product data and patent data to Gemini.
-6. Ask Gemini to produce a normalized JSON analysis.
-7. Return the synthesized result to the client.
+- if `upc` is missing, the API returns `400`
+- if any part of the aggregation pipeline fails, the API returns `500`
+- if the flow succeeds, the API returns `200` with `status: "success"`
 
-It is an orchestration and enrichment API.
+## 6. End-to-End Service Flow
 
-## 4. Request Flow
+This section describes the complete request flow from entry to final response.
 
-### 4.1 Entry Point
+### 6.1 Application Startup
 
-The server starts in `cmd/api/main.go`.
+When the service starts:
 
-Responsibilities:
+1. `main()` loads `.env` using `godotenv`.
+2. A default Gin router is created.
+3. Route group `/api/v1` is created.
+4. `GET /product` is mapped to `handlers.GetProductInfo`.
+5. The server starts on port `8080`.
 
-- load local environment variables with `godotenv`
-- create a Gin router
-- register versioned routes under `/api/v1`
-- expose `GET /product`
-- run the server on port `8080`
+### 6.2 Request Reception
 
-### 4.2 HTTP Handler Flow
+The request enters `GetProductInfo(c *gin.Context)`.
 
-The request enters `internal/handlers/product_handler.go`.
+The handler performs only HTTP responsibilities:
 
-Handler responsibilities:
+1. read the `upc` query parameter
+2. validate that it exists
+3. call `services.AggregateProductData(upcCode)`
+4. transform service success or failure into an HTTP response
 
-1. Read the `upc` query parameter.
-2. Reject the request with `400 Bad Request` if `upc` is missing.
-3. Call `services.AggregateProductData(upcCode)`.
-4. Return `500 Internal Server Error` if aggregation fails.
-5. Return a success payload if aggregation succeeds.
+This separation is good because it keeps the handler thin and pushes business logic into the service layer.
 
-Expected API response envelope:
+### 6.3 Orchestration Begins
 
-```json
-{
-  "status": "success",
-  "data": {
-    "...": "normalized product insight response"
-  }
-}
-```
+Inside `AggregateProductData(upcCode string)`:
 
-### 4.3 Service Orchestration Flow
+1. a request-scoped timeout context is created with `45 seconds`
+2. the service begins the product lookup phase
+3. the returned data becomes the base object for the final result
 
-The main pipeline lives in `internal/services/aggregator.go`.
+This function is the heart of the service. It is where retrieval, analysis, and merging are coordinated.
 
-`AggregateProductData(upcCode string)` performs the following steps:
+## 7. How the Service Gets Data
 
-1. Create a request context with a `45s` timeout.
-2. Call `fetchSeedData(ctx, upcCode)`.
-3. Validate that a product was returned.
-4. Extract the product brand from the first UPC item.
-5. Launch patent lookup logic in a goroutine.
-6. Wait for the patent lookup to finish.
-7. Call `synthesizeWithLLM(ctx, seedData, patentData)`.
-8. Ensure the original UPC is set in the final response.
-9. Return the normalized result.
+The service gets data from two external systems before involving the LLM.
 
-Even though the patent request currently runs in a single goroutine and is immediately awaited, the structure suggests the service is being shaped for future fan-out or parallel expansion.
+### 7.1 Step One: Product Retrieval from UPCitemdb
 
-## 5. Detailed Internal Flow
+Function used:
 
-### 5.1 UPC Lookup
+- `fetchSeedData(ctx, upc string)`
 
-Function: `fetchSeedData(ctx, upc string)`
+How it works:
 
-What it does:
+1. It builds a GET request to:
+   `https://api.upcitemdb.com/prod/trial/lookup?upc=<UPC>`
+2. It sends the request with a shared HTTP client.
+3. It rejects any non-200 response.
+4. It decodes the JSON body into `models.UPCResponse`.
 
-- builds a GET request to `https://api.upcitemdb.com/prod/trial/lookup?upc=<code>`
-- sends the request with a shared HTTP client
-- rejects non-200 responses
-- decodes the response into `models.UPCResponse`
+What the service takes from this response:
 
-Why it matters:
+- `title`
+- `brand`
+- `model`
+- `description`
+- `offers`
 
-- this is the source of product identity
-- brand extracted from this response drives the patent lookup step
-- description and features from this response help Gemini produce a richer final summary
+Why this matters:
 
-### 5.2 USPTO Patent Lookup
+- it provides the product identity
+- it provides commercial offer data for marketplaces and pricing
+- it provides the raw description that Gemini later refines
 
-Function: `fetchPatentData(ctx, brand string)`
+### 7.2 Step Two: Patent Retrieval from USPTO
 
-What it does:
+Function used:
 
-- loads `USPTO_API_KEY` from the environment
-- constructs a search query based on the product brand:
-  `assignee:"<brand>"`
-- calls the USPTO API
-- attaches required headers:
-  - `Accept: application/json`
-  - `X-API-Key: <USPTO_API_KEY>`
-- rejects non-200 responses and includes the error body
-- decodes the result into `models.PatentsViewResponse`
+- `fetchPatentData(ctx, brand string)`
 
-Why it matters:
+How it works:
 
-- this step tries to connect the brand to potentially relevant patent/application records
-- the output provides raw patent metadata that Gemini later interprets
+1. It reads `USPTO_API_KEY` from the environment.
+2. It builds a USPTO search query using the product brand:
+   `assignee:"<brand>"`
+3. It creates a GET request to the USPTO applications search endpoint.
+4. It sets the required headers:
+   - `Accept: application/json`
+   - `X-API-Key: <USPTO_API_KEY>`
+5. It validates the response status code.
+6. It decodes the response into `models.PatentsViewResponse`.
 
-### 5.3 LLM Synthesis
+What the service takes from this response:
 
-Function: `synthesizeWithLLM(ctx, seedData, patentData)`
+- `filingDate`
+- `firstInventorName`
+- `applicantNameText`
+- `countryName`
+- raw patent/application records for Gemini analysis
 
-What it does:
+Why this matters:
 
-1. Reads and sanitizes `GEMINI_API_KEY`.
-2. Marshals UPC and patent data into JSON strings.
-3. Builds a strict prompt that:
-   - frames the model as a technical and IP analysis assistant
-   - asks for JSON only
-   - defines the exact response schema
-4. Sends the request to:
+- it provides legal and technical metadata not available in UPC data
+- it gives the service a basis for inferring manufacturer and country information
+- it gives Gemini context for the IP analysis portion of the final response
+
+## 8. How the Service Analyzes Data
+
+The service uses two different analysis strategies:
+
+- manual analysis and mapping in Go
+- AI analysis through Gemini
+
+### 8.1 Manual Analysis in Go
+
+The current service intentionally performs direct mapping for fields that can be deterministically extracted.
+
+This includes:
+
+- product identity
+- commercial marketplaces
+- average price
+- manufacturer fallback
+- country of origin
+- patent filing date
+- key inventor
+
+The important point is that these fields are not delegated to the LLM unless interpretation is actually needed.
+
+### 8.2 LLM Analysis Through Gemini
+
+Function used:
+
+- `synthesizeWithLLM(ctx, description, patentData)`
+
+How it works:
+
+1. It reads and sanitizes `GEMINI_API_KEY`.
+2. It serializes the patent response into JSON.
+3. It builds a prompt instructing Gemini to:
+   - read the raw product description
+   - gracefully complete it if it is truncated
+   - rewrite it as a polished paragraph
+   - summarize the core invention idea
+   - generate associated patents and claim-chart style mappings
+4. It calls:
    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`
-5. Forces the response MIME type to JSON.
-6. Handles non-200 responses with detailed error output.
-7. Decodes Gemini's response envelope.
-8. Extracts the returned JSON text.
-9. Removes optional markdown fences if the model still returns them.
-10. Unmarshals the final JSON into `models.FinalProductInfo`.
+5. It forces a JSON-only response.
+6. It validates the HTTP response.
+7. It decodes the Gemini response envelope.
+8. It extracts the text payload.
+9. It parses that JSON into `models.LLMAnalysisResult`.
 
-Why it matters:
+What Gemini currently produces:
 
-- this is the step that converts multiple raw upstream payloads into a single normalized, client-ready response
-- instead of hand-writing complex field mapping logic, the design uses an LLM to synthesize structured meaning from heterogeneous inputs
+- `polished_description`
+- `core_invention_idea`
+- `intellectual_property_analysis`
 
-## 6. Output Schema
+This is an important architectural change from a fully AI-composed result. In the current version, Gemini is no longer responsible for the entire response. It is responsible only for the interpretation-heavy fields.
 
-The final normalized output is defined in `internal/models/product.go`.
+## 9. How the Service Merges Data
 
-Top-level fields:
+The current implementation follows a layered merge strategy.
+
+### 9.1 Base Response Initialization
+
+After the UPC response is returned, the service initializes `FinalProductInfo` with:
+
+- a generated `product_id`
+- `product_identity` from UPC data
+- the raw UPC description as the temporary description
+- an empty `technical_specifications` map
+- `commercial_details.manufacturer` set to the product brand as the initial fallback
+- an empty `marketplaces` list
+
+This is the first merge stage: create a stable response skeleton from the most reliable product-facing source.
+
+### 9.2 Commercial Merge from UPC Offers
+
+The service then iterates through `item.Offers` and maps each offer into `models.Marketplace`.
+
+For each offer it captures:
+
+- merchant name
+- price
+- currency
+- product link
+
+At the same time, it computes:
+
+- total price
+- offer count
+- average price
+
+This is a strong design choice because price computation remains deterministic and transparent in Go rather than being inferred by the LLM.
+
+### 9.3 Patent Metadata Merge
+
+After the USPTO response is retrieved, the service walks through the patent records to find the first usable values for:
+
+- `patent_filing_date`
+- `key_inventor`
+- `manufacturer`
+- `country_of_origin`
+
+Important behavior in this stage:
+
+- manufacturer is initially set from UPC brand
+- manufacturer is overwritten if a more formal applicant name is found in USPTO data
+- country is pulled from correspondence address information
+- the loop stops early once all desired fields have been found
+
+This is the second merge stage: enrich deterministic fields using legal metadata.
+
+### 9.4 LLM Merge
+
+After deterministic mapping is complete, Gemini is called.
+
+The returned LLM fields are merged into the existing response:
+
+- `finalResult.Description = llmAnalysis.PolishedDescription`
+- `finalResult.CoreInventionIdea = llmAnalysis.CoreInventionIdea`
+- `finalResult.IPAnalysis = llmAnalysis.IPAnalysis`
+
+This is the third merge stage: overwrite or fill the interpretation-heavy fields with AI-generated analysis while preserving the deterministic fields already built by Go.
+
+## 10. Why the Current Hybrid Approach Is Strong
+
+The current architecture is stronger than a purely manual mapper or a purely LLM-generated response.
+
+### 10.1 Why Not Manual Mapping Only
+
+Manual mapping alone is reliable for:
+
+- identity fields
+- pricing fields
+- marketplace fields
+- patent metadata fields
+
+However, manual mapping is weak at:
+
+- polishing incomplete descriptions
+- summarizing invention concepts
+- producing claim-chart style analysis
+
+### 10.2 Why Not LLM for Everything
+
+Using the LLM for all fields would create unnecessary risk:
+
+- pricing might be hallucinated
+- links might be omitted or reformatted
+- brand or model values might drift
+- structured values could become inconsistent
+
+### 10.3 Why the Combination Works
+
+The current design divides responsibilities in a sensible way:
+
+- Go handles retrieval, validation, mapping, and arithmetic
+- external APIs provide authoritative source data
+- Gemini handles interpretation, completion, and synthesis
+
+That means the service is:
+
+- structured where it should be structured
+- flexible where it needs inference
+- easier to reason about when debugging
+
+## 11. Output Data Model
+
+The final response model is defined by `models.FinalProductInfo`.
+
+Current top-level output fields:
 
 - `product_id`
 - `product_identity`
+- `commercial_details`
 - `product_description`
-- `product_features`
 - `core_invention_idea`
 - `technical_specifications`
 - `intellectual_property_analysis`
 
-### 6.1 Product Identity
+### 11.1 Product Identity
 
 Contains:
 
@@ -204,155 +416,305 @@ Contains:
 - `model`
 - `upc`
 
-### 6.2 Intellectual Property Analysis
+### 11.2 Commercial Details
+
+Contains:
+
+- `manufacturer`
+- `country_of_origin`
+- `average_price`
+- `marketplaces`
+
+Each marketplace record contains:
+
+- `store_name`
+- `price`
+- `currency`
+- `product_link`
+
+### 11.3 Technical Specifications
+
+The current implementation fills this map with patent-related metadata such as:
+
+- `patent_filing_date`
+- `key_inventor`
+
+This map can scale later if more structured technical fields are introduced.
+
+### 11.4 Intellectual Property Analysis
 
 Contains:
 
 - `associated_patents`
 - `claim_charts`
 
-Each `claim_chart` includes:
+Each claim chart includes:
 
 - `patent_claim`
 - `product_feature_mapped`
 - `invalidity_search_relevance`
 
+## 12. Concurrency and Control Flow Notes
 
-## 7. Technology Choices and Why They Make Sense
-### 7.1 External APIs
+The patent fetch step is currently launched inside a goroutine with a `WaitGroup`, then awaited immediately.
 
-#### UPCitemdb: provides concrete product metadata
+This means:
 
-- resolves UPC codes into product metadata
-- provides a starting point for product identity and features
+- the code is already shaped for possible future parallel expansion
+- the current implementation still behaves effectively as sequential orchestration
 
-#### USPTO API: provides legal and technical patent-related context
+The service also uses:
 
-- provides a patent/application data source linked to the brand
-- enables IP-oriented enrichment beyond standard product metadata
+- one shared HTTP client with a `60s` timeout
+- one request context with a `45s` timeout for the whole aggregation
 
-### 7.2 Gemini: converts raw external data into a structured final insight object
+This provides basic protection against hanging upstream requests.
 
-- combines raw product and patent data into structured analysis
-- reduces the amount of hard-coded business mapping logic
-- can infer relationships between product features and patent concepts
+## 13. Error Handling Approach
 
+The service currently handles failures in a pragmatic way:
 
-## 8. Current Limitations and Practical Considerations
+- missing `upc` returns `400`
+- failed external calls return `500`
+- missing environment keys cause explicit errors
+- non-200 responses from USPTO or Gemini include useful error details
+- empty Gemini candidate results are rejected
 
-Based on the current codebase, these are important operational notes:
+This is appropriate for a prototype or early service, although a production version would likely add typed error categories and more structured logging.
 
-- the service currently assumes the first UPC item is the correct product match
-- patent lookup is based on brand-level search, which may be broad or noisy
-- the LLM output is only as reliable as the upstream data and prompt quality
-- the patent fetch goroutine does not yet add much concurrency value because it is awaited immediately
-- there is no test suite yet
-- there is no caching layer, so repeated requests will hit external APIs every time
+## 14. Current Limitations
+
+The following limitations are visible in the current code:
+
+- the service assumes the first UPC result is the correct product
+- USPTO lookup uses only the brand as search input, which may be noisy
+- if USPTO returns weak data, manufacturer and country may remain incomplete
+- Gemini output quality still depends on prompt quality and upstream data quality
+- the patent goroutine is not yet delivering real concurrency gains
+- there are no automated tests in the current repository snapshot
+- there is no caching for repeated UPC lookups
 - there is no retry strategy for transient upstream failures
-- there is a debug print in `fetchSeedData`:
-  `fmt.Println("data", data)`
 
-## 9. Configuration and Runtime Requirements
+
+## 15. How To Run the Service
+
+### 15.1 Prerequisites
+
+Before running the service, ensure:
+
+- the required API keys are available
 
 Required environment variables:
 
 - `GEMINI_API_KEY`
 - `USPTO_API_KEY`
 
-Local development behavior:
+The application attempts to load these from `.env` at startup. If `.env` is missing, it falls back to system environment variables.
 
-- the app attempts to load `.env`
-- if `.env` is missing, it falls back to system environment variables
+### 15.2 Install Dependencies
 
-Security note:
+Run:
 
-- API keys should remain private
-- `.env` should not be committed to shared version control
-- report documents should never include live secret values
-
-## 10. Example End-to-End Flow
-
-Here is the practical request path:
-
-1. Client sends:
-   `GET /api/v1/product?upc=0885909950805`
-2. Handler validates the query parameter.
-3. Service fetches product metadata from UPCitemdb.
-4. Service extracts the product brand.
-5. Service queries the USPTO API with the brand.
-6. Service sends both raw datasets to Gemini.
-7. Gemini returns JSON text describing the normalized result.
-8. Service parses that JSON into `FinalProductInfo`.
-9. Handler returns:
-   - status: `success`
-   - data: normalized result
-
-## 11. Suggested Future Enhancements
-
-If this service grows, these would be natural next improvements:
-
-- add unit and integration tests
-- add retries with backoff for external API calls
-- add structured logging
-- add request IDs for traceability
-- add response caching by UPC
-- validate and sanitize more of the LLM response
-- improve patent filtering and ranking before sending to Gemini
-- move prompt text into a separate prompt template or config layer
-- add OpenAPI or Swagger documentation
-
-## 12. API Response Paste Area
-
-Use the sections below to paste real responses during testing or documentation.
-
-### 12.1 Request Used
-
-```text
-GET /api/v1/product?upc=804595002001
+```powershell
+go mod download
 ```
 
+### 15.3 Run Normally
 
-### 12.2 Final API Response Returned by This Service
+Run the API directly with Go:
+
+```powershell
+go run cmd/api/main.go
+```
+
+Expected startup message:
+
+```text
+Server is running at http://localhost:8080
+```
+
+### 15.4 Run With Live Reload
+
+This project also includes `.air.toml`, so it can be run with `air` for automatic rebuilds during development.
+
+If `air` is installed, run:
+
+```powershell
+air
+```
+
+Based on the current configuration:
+
+- the build output is written to `tmp/main.exe`
+- the build command is:
+  `go build -o ./tmp/main.exe ./cmd/api/main.go`
+- Go, template, and HTML file changes are watched
+
+### 15.5 Test the Endpoint
+
+Once the server is running, call:
+
+```powershell
+curl "http://localhost:8080/api/v1/product?upc=9780593486634"
+```
+
+Or in a browser/Postman:
+
+```text
+http://localhost:8080/api/v1/product?upc=9780593486634
+```
+
+## 16. Example Runtime Flow
+
+This is the practical execution sequence for one request:
+
+1. The client sends `GET /api/v1/product?upc=<value>`.
+2. The handler validates that `upc` is present.
+3. The service requests product data from `UPCitemdb`.
+4. The first UPC item is used as the product baseline.
+5. The service maps identity and offer data into the response object.
+6. The service requests patent application data from `USPTO` using the brand.
+7. The service maps filing date, inventor, manufacturer, and country when available.
+8. The service sends the raw description and patent data to `Gemini`.
+9. Gemini returns a JSON analysis payload.
+10. The service merges the polished description, invention idea, and IP analysis into the existing response.
+11. The handler returns the unified JSON payload.
+
+## 17. API Response Paste Area
+
+Use the section below if you want to attach live output when sending the report.
+
+### 17.1 Request Used
+
+```text
+GET /api/v1/product?upc=9780593486634
+```
+
+### 17.2 Final API Response Returned by This Service
 
 ```json
 {
     "data": {
-        "product_id": "NM9170BK_PROD_001",
+        "product_id": "PRD-4756d3f84460bccfbbb405d31416824c",
         "product_identity": {
-            "title": "NOVAMEDIC NM-9170-BK Professional Aneroid Sphygmomanometer Blood Pressure Machine and Stethoscope Set, Universal Adult Size Cuff Arm, Manual Emergency BP Monitor Kit with Carrying Case, Black (B09MDJ2QNG)",
-            "brand": "Novamedic",
-            "model": "NM-9170-BK",
-            "upc": "804595002001"
+            "title": "Mrs. Peanuckle's Earth Alphabet - (Mrs. Peanuckle's Alphabet) by Mrs Peanuckle (Board Book)",
+            "brand": "",
+            "model": "",
+            "upc": "9780593486634"
         },
-        "product_description": "The NOVAMEDIC NM-9170-BK is a professional aneroid sphygmomanometer blood pressure machine and stethoscope set designed for manual emergency blood pressure monitoring. It features a universal adult size cuff arm and comes with a convenient carrying case. The kit is presented in black, offering a complete solution for healthcare professionals or personal use.",
-        "product_features": [
-            "Professional Aneroid Sphygmomanometer",
-            "Blood Pressure Machine and Stethoscope Set",
-            "Universal Adult Size Cuff Arm",
-            "Manual Emergency BP Monitor Kit",
-            "Includes Carrying Case",
-            "Black color"
-        ],
-        "core_invention_idea": "A comprehensive, manually operated, professional-grade aneroid sphygmomanometer and stethoscope set for accurate blood pressure measurement, packaged for portability and universal adult use.",
+        "commercial_details": {
+            "manufacturer": "Stratasys, Inc.",
+            "country_of_origin": "UNITED STATES",
+            "average_price": 59.51285714285715,
+            "marketplaces": [
+                {
+                    "store_name": "Kohl's",
+                    "price": 8.99,
+                    "currency": "",
+                    "product_link": "https://www.upcitemdb.com/norob/alink/?id=v2r2x2z2z2637474q2&tid=3&seq=1774337509&plt=75a7aba4d50953ff05ab39a3dc08b0e5"
+                },
+                {
+                    "store_name": "eCampus.com",
+                    "price": 6.74,
+                    "currency": "",
+                    "product_link": "https://www.upcitemdb.com/norob/alink/?id=v2q253131353c444w2&tid=3&seq=1774337509&plt=b9bc9e2efe681f3cc1abd659db3653f7"
+                },
+                {
+                    "store_name": "UnbeatableSale.com",
+                    "price": 12.49,
+                    "currency": "",
+                    "product_link": "https://www.upcitemdb.com/norob/alink/?id=v2r223w213y284b4x2&tid=3&seq=1774337509&plt=7306e0dbc3d68ba5933c7f2eaf892155"
+                },
+                {
+                    "store_name": "BiggerBooks.com",
+                    "price": 6.94,
+                    "currency": "",
+                    "product_link": "https://www.upcitemdb.com/norob/alink/?id=v2q25323v223e454z2&tid=3&seq=1774337509&plt=d9e2954ebb7278f8921f899ccf446ae9"
+                },
+                {
+                    "store_name": "Rakuten(Buy.com)",
+                    "price": 366.44,
+                    "currency": "",
+                    "product_link": "https://www.upcitemdb.com/norob/alink/?id=u2x20323y233f474q2&tid=3&seq=1774337509&plt=ae725d18ef50e279b8df0de3fa1de531"
+                },
+                {
+                    "store_name": "Target",
+                    "price": 7,
+                    "currency": "",
+                    "product_link": "https://www.upcitemdb.com/norob/alink/?id=v2q243w23363b4d4u2&tid=3&seq=1774337509&plt=96d620f6abe1ad6df91da52136ee60d4"
+                },
+                {
+                    "store_name": "VitalSource ",
+                    "price": 7.99,
+                    "currency": "ZAR",
+                    "product_link": "https://www.upcitemdb.com/norob/alink/?id=v2q2532313y29494t2&tid=3&seq=1774337509&plt=73eb6f36159fe89372228deb3c4e66f3"
+                }
+            ]
+        },
+        "product_description": "The product description was not provided, therefore a detailed analysis of specific product features and a completion of any cut-off sentences cannot be performed. This significantly limits the ability to precisely identify the product's market position or unique selling propositions.",
+        "core_invention_idea": "Without a product description or specific product features, it is impossible to determine a core invention idea. The provided patent data covers an extremely wide array of disparate technologies including cooking devices, additive manufacturing molds, shock absorbers, deep learning, LiDAR systems, adjustable bassinets, tailgate deactivation systems, energy harvesting, and various communication technologies. This diverse set of patents does not point to a single core invention for a specific product.",
         "technical_specifications": {
-            "brand": "Novamedic",
-            "color": "Black",
-            "cuff_size": "Universal Adult Size",
-            "included_components": "Sphygmomanometer, Stethoscope, Cuff, Carrying Case",
-            "measurement_method": "Aneroid",
-            "model_number": "NM-9170-BK",
-            "operation_mode": "Manual"
+            "key_inventor": "12426739",
+            "patent_filing_date": "2026-03-20"
         },
         "intellectual_property_analysis": {
-            "associated_patents": [],
-            "claim_charts": []
+            "associated_patents": [
+                "90016067",
+                "19573211",
+                "90016068",
+                "19115961",
+                "90016065",
+                "90016063",
+                "90016066",
+                "19572431",
+                "19571835",
+                "19571386",
+                "90016062",
+                "90016059",
+                "19570818",
+                "90016052",
+                "90016058",
+                "90016057",
+                "18463811",
+                "19059560",
+                "90016055",
+                "90016056",
+                "90016051",
+                "90016050",
+                "90016048",
+                "19140425",
+                "90016054"
+            ],
+            "claim_charts": [
+                {
+                    "patent_claim": "COOKING DEVICES AND COMPONENTS THEREOF (from application 90016067)",
+                    "product_feature_mapped": "Product description and features are not provided, preventing any meaningful mapping.",
+                    "invalidity_search_relevance": "Cannot assess without product features."
+                },
+                {
+                    "patent_claim": "SACRIFICIAL ADDITIVELY MANUFACTURED MOLDS FOR USE IN INJECTION MOLDING PROCESSES (from application 19573211)",
+                    "product_feature_mapped": "Product description and features are not provided, preventing any meaningful mapping.",
+                    "invalidity_search_relevance": "Cannot assess without product features."
+                },
+                {
+                    "patent_claim": "DEPTH-ADJUSTABLE BASSINET (from application 19571386)",
+                    "product_feature_mapped": "Product description and features are not provided, preventing any meaningful mapping.",
+                    "invalidity_search_relevance": "Cannot assess without product features."
+                },
+                {
+                    "patent_claim": "ACCELERATED DEEP LEARNING (from application 19572431)",
+                    "product_feature_mapped": "Product description and features are not provided, preventing any meaningful mapping.",
+                    "invalidity_search_relevance": "Cannot assess without product features."
+                }
+            ]
         }
     },
     "status": "success"
 }
 ```
 
+## 18. Conclusion
 
-## 13. Short Summary
+The current version of `product-insight-api` is best described as a hybrid enrichment service. It does not simply proxy third-party APIs and it does not delegate the entire result to AI. Instead, it retrieves authoritative source data, maps the deterministic fields in Go, uses Gemini only for interpretation-heavy analysis, and then merges all pieces into a single normalized response.
 
-This service is an AI-assisted enrichment API built in Go. It takes a UPC code, gathers product and patent-related data from external systems, and uses Gemini to transform those inputs into a normalized analysis object. The architecture is simple, practical, and easy to extend, with a strong division between HTTP routing, orchestration logic, and data models.
+From an engineering perspective, this is a sensible architecture for the problem being solved. It keeps control over structured data while still benefiting from the reasoning strengths of an LLM. As a result, the service is easier to maintain, easier to debug, and more trustworthy than an all-LLM pipeline, while still being more capable than a strictly hard-coded mapper.
