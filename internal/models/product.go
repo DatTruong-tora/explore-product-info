@@ -9,6 +9,7 @@ type FinalProductInfo struct {
 	CoreInventionIdea string            `json:"core_invention_idea"`
 	TechSpecs         map[string]string `json:"technical_specifications"`
 	IPAnalysis        IPAnalysisData    `json:"intellectual_property_analysis"`
+	Vector            []float32         `json:"vector"`
 }
 
 type CommercialInfo struct {

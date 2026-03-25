@@ -17,6 +17,9 @@ import (
 	"time"
 
 	"github.com/DatTruong-tora/product-insight-api/internal/models"
+
+	"github.com/milvus-io/milvus-sdk-go/v2/client"
+	"github.com/milvus-io/milvus-sdk-go/v2/entity"
 )
 
 // Shared HTTP client to avoid connection bottlenecks.
@@ -177,6 +180,108 @@ func synthesizeWithLLM(ctx context.Context, description string, patentData *mode
 	return &analysis, nil
 }
 
+// ---------------- NEW FUNCTIONS FOR MILVUS AND EMBEDDING ----------------
+// Transform text to vector embedding using Gemini Embedding API
+func generateEmbedding(ctx context.Context, text string) ([]float32, error) {
+	apiKey := strings.Trim(strings.TrimSpace(os.Getenv("GEMINI_API_KEY")), `"'`)
+	if apiKey == "" {
+		return nil, fmt.Errorf("missing GEMINI_API_KEY environment variable")
+	}
+
+	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
+
+	reqBody := map[string]interface{}{
+		"model": "models/gemini-embedding-001",
+		"content": map[string]interface{}{
+			"parts": []map[string]string{{"text": text}},
+		},
+		"output_dimensionality": 768,
+	}
+	bodyBytes, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("could not create Embedding request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Embedding API failed with status %d. Google error details: %s", resp.StatusCode, string(errBody))
+	}
+
+	var result struct {
+		Embedding struct {
+			Values []float32 `json:"values"`
+		} `json:"embedding"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return result.Embedding.Values, nil
+}
+
+// Connect and save data to Milvus
+func saveToMilvus(ctx context.Context, finalInfo *models.FinalProductInfo) error {
+	c, err := client.NewClient(ctx, client.Config{
+		// bring address to the .env file
+		Address: os.Getenv("MILVUS_ADDRESS"),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to connect to Milvus: %v", err)
+	}
+	defer c.Close()
+
+	collectionName := "product_info"
+
+	has, err := c.HasCollection(ctx, collectionName)
+	if err != nil {
+		return err
+	}
+
+	if !has {
+		// Define the Schema (Structure of the table in Milvus)
+		schema := entity.NewSchema().WithName(collectionName).WithDescription("Store product embeddings for semantic search")
+		// Column 1: Product ID (Primary Key)
+		schema.WithField(entity.NewField().WithName("product_id").WithDataType(entity.FieldTypeVarChar).WithMaxLength(256).WithIsPrimaryKey(true))
+		// Column 2: Title (To display quickly)
+		schema.WithField(entity.NewField().WithName("title").WithDataType(entity.FieldTypeVarChar).WithMaxLength(1000))
+		// Column 3: Vector embedding (requested as 768 dimensions from Gemini)
+		schema.WithField(entity.NewField().WithName("vector").WithDataType(entity.FieldTypeFloatVector).WithDim(768))
+
+		err = c.CreateCollection(ctx, schema, entity.DefaultShardNumber)
+		if err != nil {
+			return fmt.Errorf("failed to create Milvus collection: %v", err)
+		}
+
+		// Must create Index for the vector column to allow Milvus to search
+		idx, _ := entity.NewIndexHNSW(entity.COSINE, 8, 200)
+		c.CreateIndex(ctx, collectionName, "vector", idx, false)
+	}
+
+	// Prepare data to Insert
+	idCol := entity.NewColumnVarChar("product_id", []string{finalInfo.ProductID})
+	titleCol := entity.NewColumnVarChar("title", []string{finalInfo.ProductIdentity.Title})
+	vectorCol := entity.NewColumnFloatVector("vector", 768, [][]float32{finalInfo.Vector})
+
+	// Insert into Milvus
+	_, err = c.Insert(ctx, collectionName, "", idCol, titleCol, vectorCol)
+	if err != nil {
+		return fmt.Errorf("failed to insert vector to Milvus: %v", err)
+	}
+
+	// Push data from RAM to the Hard Disk of Milvus
+	c.Flush(ctx, collectionName, false)
+	return nil
+}
+
 // 4. Orchestrator: Manual mapping here
 func AggregateProductData(upcCode string) (*models.FinalProductInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -243,10 +348,7 @@ func AggregateProductData(upcCode string) (*models.FinalProductInfo, error) {
 
 	// 4.4. Manual mapping of patent data to technical specs
 	if patentData != nil && len(patentData.PatentFileWrapperDataBag) > 0 {
-		foundManufacturer := false
-		foundCountry := false
-		foundFilingDate := false
-		foundInventor := false
+		foundManufacturer, foundCountry, foundFilingDate, foundInventor := false, false, false, false
 
 		for _, patentItem := range patentData.PatentFileWrapperDataBag {
 			meta := patentItem.ApplicationMetaData
@@ -292,6 +394,28 @@ func AggregateProductData(upcCode string) (*models.FinalProductInfo, error) {
 	finalResult.Description = llmAnalysis.PolishedDescription
 	finalResult.CoreInventionIdea = llmAnalysis.CoreInventionIdea
 	finalResult.IPAnalysis = llmAnalysis.IPAnalysis
+
+	// 4.7. Generate Vector Embeddings
+	log.Println("[4] Generating Vector Embeddings...")
+	textToEmbed := fmt.Sprintf("Title: %s. Brand: %s. Core Idea: %s. Description: %s",
+		finalResult.ProductIdentity.Title,
+		finalResult.ProductIdentity.Brand,
+		finalResult.CoreInventionIdea,
+		finalResult.Description)
+
+	vector, err := generateEmbedding(ctx, textToEmbed)
+	if err != nil {
+		log.Printf("Warning: Failed to generate embedding: %v", err)
+	} else {
+		finalResult.Vector = vector
+
+		log.Println("[5] Saving data to Milvus...")
+		if err := saveToMilvus(ctx, finalResult); err != nil {
+			log.Printf("Warning: Failed to save to Milvus: %v", err)
+		} else {
+			log.Printf("=> Successfully saved Product %s to Milvus Database!", finalResult.ProductID)
+		}
+	}
 
 	return finalResult, nil
 }
