@@ -263,7 +263,10 @@ func saveToMilvus(ctx context.Context, finalInfo *models.FinalProductInfo) error
 
 		// Must create Index for the vector column to allow Milvus to search
 		idx, _ := entity.NewIndexHNSW(entity.COSINE, 8, 200)
-		c.CreateIndex(ctx, collectionName, "vector", idx, false)
+		err = c.CreateIndex(ctx, collectionName, "vector", idx, false)
+		if err != nil {
+			return fmt.Errorf("failed to create index: %v", err)
+		}
 	}
 
 	// Prepare data to Insert
