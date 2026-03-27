@@ -2,9 +2,13 @@ package main
 
 import (
 	"log"
+	"time"
+
+	"github.com/DatTruong-tora/product-insight-api/internal/handlers"
+	"github.com/DatTruong-tora/product-insight-api/internal/middleware"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
-	"github.com/DatTruong-tora/product-insight-api/internal/handlers"
+	"golang.org/x/time/rate"
 )
 
 func main() {
@@ -16,12 +20,14 @@ func main() {
 
 	// Initialize the default Gin router, including Logger and Recovery middleware.
 	router := gin.Default()
+	router.Use(middleware.NewRateLimiter(rate.Limit(5), 10, 3*time.Minute).Middleware())
 
 	// Define versioned API route groups.
 	v1 := router.Group("/api/v1")
 	{
 		// Map the HTTP GET request to its handler.
 		v1.GET("/product", handlers.GetProductInfo)
+		v1.GET("/search", handlers.SearchProducts)
 	}
 
 	log.Println("Server is running at http://localhost:8080")
