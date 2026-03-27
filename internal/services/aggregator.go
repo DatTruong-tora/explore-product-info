@@ -25,6 +25,29 @@ import (
 // Shared HTTP client to avoid connection bottlenecks.
 var httpClient = &http.Client{Timeout: 60 * time.Second}
 
+const (
+	milvusCollectionName = "product_info"
+	vectorFieldName      = "vector"
+	titleFieldName       = "title"
+	vectorDimension      = 768
+)
+
+func newMilvusClient(ctx context.Context) (client.Client, error) {
+	address := strings.TrimSpace(os.Getenv("MILVUS_ADDRESS"))
+	if address == "" {
+		return nil, fmt.Errorf("missing MILVUS_ADDRESS environment variable")
+	}
+
+	c, err := client.NewClient(ctx, client.Config{
+		Address: address,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Milvus: %v", err)
+	}
+
+	return c, nil
+}
+
 // 1. Call the UPC API.
 func fetchSeedData(ctx context.Context, upc string) (*models.UPCResponse, error) {
 	reqURL := fmt.Sprintf("https://api.upcitemdb.com/prod/trial/lookup?upc=%s", upc)
@@ -230,31 +253,26 @@ func generateEmbedding(ctx context.Context, text string) ([]float32, error) {
 
 // Connect and save data to Milvus
 func saveToMilvus(ctx context.Context, finalInfo *models.FinalProductInfo) error {
-	c, err := client.NewClient(ctx, client.Config{
-		// bring address to the .env file
-		Address: os.Getenv("MILVUS_ADDRESS"),
-	})
+	c, err := newMilvusClient(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to connect to Milvus: %v", err)
+		return err
 	}
 	defer c.Close()
 
-	collectionName := "product_info"
-
-	has, err := c.HasCollection(ctx, collectionName)
+	has, err := c.HasCollection(ctx, milvusCollectionName)
 	if err != nil {
 		return err
 	}
 
 	if !has {
 		// Define the Schema (Structure of the table in Milvus)
-		schema := entity.NewSchema().WithName(collectionName).WithDescription("Store product embeddings for semantic search")
+		schema := entity.NewSchema().WithName(milvusCollectionName).WithDescription("Store product embeddings for semantic search")
 		// Column 1: Product ID (Primary Key)
 		schema.WithField(entity.NewField().WithName("product_id").WithDataType(entity.FieldTypeVarChar).WithMaxLength(256).WithIsPrimaryKey(true))
 		// Column 2: Title (To display quickly)
-		schema.WithField(entity.NewField().WithName("title").WithDataType(entity.FieldTypeVarChar).WithMaxLength(1000))
+		schema.WithField(entity.NewField().WithName(titleFieldName).WithDataType(entity.FieldTypeVarChar).WithMaxLength(1000))
 		// Column 3: Vector embedding (requested as 768 dimensions from Gemini)
-		schema.WithField(entity.NewField().WithName("vector").WithDataType(entity.FieldTypeFloatVector).WithDim(768))
+		schema.WithField(entity.NewField().WithName(vectorFieldName).WithDataType(entity.FieldTypeFloatVector).WithDim(vectorDimension))
 
 		err = c.CreateCollection(ctx, schema, entity.DefaultShardNumber)
 		if err != nil {
@@ -263,7 +281,7 @@ func saveToMilvus(ctx context.Context, finalInfo *models.FinalProductInfo) error
 
 		// Must create Index for the vector column to allow Milvus to search
 		idx, _ := entity.NewIndexHNSW(entity.COSINE, 8, 200)
-		err = c.CreateIndex(ctx, collectionName, "vector", idx, false)
+		err = c.CreateIndex(ctx, milvusCollectionName, vectorFieldName, idx, false)
 		if err != nil {
 			return fmt.Errorf("failed to create index: %v", err)
 		}
@@ -271,18 +289,145 @@ func saveToMilvus(ctx context.Context, finalInfo *models.FinalProductInfo) error
 
 	// Prepare data to Insert
 	idCol := entity.NewColumnVarChar("product_id", []string{finalInfo.ProductID})
-	titleCol := entity.NewColumnVarChar("title", []string{finalInfo.ProductIdentity.Title})
-	vectorCol := entity.NewColumnFloatVector("vector", 768, [][]float32{finalInfo.Vector})
+	titleCol := entity.NewColumnVarChar(titleFieldName, []string{finalInfo.ProductIdentity.Title})
+	vectorCol := entity.NewColumnFloatVector(vectorFieldName, vectorDimension, [][]float32{finalInfo.Vector})
 
 	// Insert into Milvus
-	_, err = c.Insert(ctx, collectionName, "", idCol, titleCol, vectorCol)
+	_, err = c.Insert(ctx, milvusCollectionName, "", idCol, titleCol, vectorCol)
 	if err != nil {
 		return fmt.Errorf("failed to insert vector to Milvus: %v", err)
 	}
 
 	// Push data from RAM to the Hard Disk of Milvus
-	c.Flush(ctx, collectionName, false)
+	c.Flush(ctx, milvusCollectionName, false)
 	return nil
+}
+
+func SearchProducts(query string, limit int, minScore float32) (*models.SearchResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	c, err := newMilvusClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+
+	response := &models.SearchResponse{
+		Query:    query,
+		Limit:    limit,
+		MinScore: minScore,
+		Matches:  make([]models.SearchMatch, 0),
+	}
+
+	has, err := c.HasCollection(ctx, milvusCollectionName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check Milvus collection: %v", err)
+	}
+	if !has {
+		return response, nil
+	}
+
+	if err := c.LoadCollection(ctx, milvusCollectionName, false); err != nil {
+		return nil, fmt.Errorf("failed to load Milvus collection: %v", err)
+	}
+
+	queryVector, err := generateEmbedding(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate search embedding: %v", err)
+	}
+
+	searchParam, err := entity.NewIndexHNSWSearchParam(64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Milvus search params: %v", err)
+	}
+
+	results, err := c.Search(
+		ctx,
+		milvusCollectionName,
+		[]string{},
+		"",
+		[]string{titleFieldName},
+		[]entity.Vector{entity.FloatVector(queryVector)},
+		vectorFieldName,
+		entity.COSINE,
+		limit,
+		searchParam,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search Milvus: %v", err)
+	}
+
+	if len(results) == 0 {
+		return response, nil
+	}
+
+	result := results[0]
+	idCol, ok := result.IDs.(*entity.ColumnVarChar)
+	if !ok {
+		return nil, fmt.Errorf("unexpected Milvus ID column type")
+	}
+
+	titleColumn := result.Fields.GetColumn(titleFieldName)
+	titleCol, ok := titleColumn.(*entity.ColumnVarChar)
+	if !ok {
+		return nil, fmt.Errorf("unexpected Milvus title column type")
+	}
+
+	for i := 0; i < result.ResultCount; i++ {
+		score := result.Scores[i]
+		if score < minScore {
+			continue
+		}
+
+		productID, err := idCol.ValueByIdx(i)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read Milvus product ID: %v", err)
+		}
+
+		title, err := titleCol.ValueByIdx(i)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read Milvus title: %v", err)
+		}
+
+		response.Matches = append(response.Matches, models.SearchMatch{
+			ProductID: productID,
+			Title:     title,
+			Score:     score,
+		})
+	}
+
+	return response, nil
+}
+
+func persistEmbeddingAsync(productID, title, textToEmbed string) {
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+
+		log.Println("[4] Generating vector embedding in background...")
+		vector, err := generateEmbedding(bgCtx, textToEmbed)
+		if err != nil {
+			log.Printf("Warning: Failed to generate embedding: %v", err)
+			return
+		}
+
+		record := &models.FinalProductInfo{
+			ProductID: productID,
+			ProductIdentity: models.ProductIdentity{
+				Title: title,
+			},
+			Vector: vector,
+		}
+
+		log.Println("[5] Saving data to Milvus in background...")
+		if err := saveToMilvus(bgCtx, record); err != nil {
+			log.Printf("Warning: Failed to save to Milvus: %v", err)
+			return
+		}
+
+		log.Printf("=> Successfully saved Product %s to Milvus Database!", productID)
+	}()
 }
 
 // 4. Orchestrator: Manual mapping here
@@ -291,6 +436,7 @@ func AggregateProductData(upcCode string) (*models.FinalProductInfo, error) {
 	defer cancel()
 
 	// 4.1. Fetch the product data from UPC (Contains links, prices, descriptions)
+	log.Println("[1] Fetching product data from UPC...")
 	seedData, err := fetchSeedData(ctx, upcCode)
 	if err != nil || len(seedData.Items) == 0 {
 		return nil, fmt.Errorf("UPC lookup failed: %v", err)
@@ -334,6 +480,7 @@ func AggregateProductData(upcCode string) (*models.FinalProductInfo, error) {
 	}
 
 	// 4.3. Fetch patent data
+	log.Println("[2] Fetching patent data from USPTO...")
 	var wg sync.WaitGroup
 	var patentData *models.PatentsViewResponse
 
@@ -398,27 +545,14 @@ func AggregateProductData(upcCode string) (*models.FinalProductInfo, error) {
 	finalResult.CoreInventionIdea = llmAnalysis.CoreInventionIdea
 	finalResult.IPAnalysis = llmAnalysis.IPAnalysis
 
-	// 4.7. Generate Vector Embeddings
-	log.Println("[4] Generating Vector Embeddings...")
+	// 4.7. Offload embedding generation and Milvus persistence off the critical path.
 	textToEmbed := fmt.Sprintf("Title: %s. Brand: %s. Core Idea: %s. Description: %s",
 		finalResult.ProductIdentity.Title,
 		finalResult.ProductIdentity.Brand,
 		finalResult.CoreInventionIdea,
 		finalResult.Description)
 
-	vector, err := generateEmbedding(ctx, textToEmbed)
-	if err != nil {
-		log.Printf("Warning: Failed to generate embedding: %v", err)
-	} else {
-		finalResult.Vector = vector
-
-		log.Println("[5] Saving data to Milvus...")
-		if err := saveToMilvus(ctx, finalResult); err != nil {
-			log.Printf("Warning: Failed to save to Milvus: %v", err)
-		} else {
-			log.Printf("=> Successfully saved Product %s to Milvus Database!", finalResult.ProductID)
-		}
-	}
+	persistEmbeddingAsync(finalResult.ProductID, finalResult.ProductIdentity.Title, textToEmbed)
 
 	return finalResult, nil
 }

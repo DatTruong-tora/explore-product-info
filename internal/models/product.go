@@ -110,3 +110,16 @@ type LLMAnalysisResult struct {
 	CoreInventionIdea   string         `json:"core_invention_idea"`
 	IPAnalysis          IPAnalysisData `json:"intellectual_property_analysis"`
 }
+
+type SearchMatch struct {
+	ProductID string  `json:"product_id"`
+	Title     string  `json:"title"`
+	Score     float32 `json:"score"`
+}
+
+type SearchResponse struct {
+	Query    string        `json:"query"`
+	Limit    int           `json:"limit"`
+	MinScore float32       `json:"min_score"`
+	Matches  []SearchMatch `json:"matches"`
+}
