@@ -27,10 +27,11 @@ type Marketplace struct {
 }
 
 type ProductIdentity struct {
-	Title string `json:"title"`
-	Brand string `json:"brand"`
-	Model string `json:"model"`
-	UPC   string `json:"upc"`
+	Title    string `json:"title"`
+	Brand    string `json:"brand"`
+	Model    string `json:"model"`
+	UPC      string `json:"upc"`
+	Category string `json:"category"`
 }
 
 type IPAnalysisData struct {
@@ -51,6 +52,7 @@ type UPCResponse struct {
 		Description string  `json:"description"`
 		Brand       string  `json:"brand"`
 		Model       string  `json:"model"`
+		Category    string  `json:"category"`
 		Offers      []Offer `json:"offers"`
 	} `json:"items"`
 }

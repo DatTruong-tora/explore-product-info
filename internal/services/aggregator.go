@@ -447,10 +447,11 @@ func AggregateProductData(upcCode string) (*models.FinalProductInfo, error) {
 	finalResult := &models.FinalProductInfo{
 		ProductID: generateRandomID(),
 		ProductIdentity: models.ProductIdentity{
-			Title: item.Title,
-			Brand: item.Brand,
-			Model: item.Model,
-			UPC:   upcCode,
+			Title:    item.Title,
+			Brand:    item.Brand,
+			Model:    item.Model,
+			UPC:      upcCode,
+			Category: item.Category,
 		},
 		Description: item.Description,
 		TechSpecs:   make(map[string]string),
