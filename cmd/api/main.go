@@ -28,6 +28,7 @@ func main() {
 		// Map the HTTP GET request to its handler.
 		v1.GET("/product", handlers.GetProductInfo)
 		v1.GET("/products-by-company", handlers.GetCompanyProducts)
+		v1.POST("/patents/related", handlers.GetRelatedPatents)
 		v1.GET("/search", handlers.SearchProducts)
 	}
 
