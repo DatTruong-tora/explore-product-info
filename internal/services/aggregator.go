@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/DatTruong-tora/product-insight-api/internal/models"
@@ -401,6 +400,10 @@ func SearchProducts(query string, limit int, minScore float32) (*models.SearchRe
 }
 
 func persistEmbeddingAsync(productID, title, textToEmbed string) {
+	if strings.TrimSpace(os.Getenv("GEMINI_API_KEY")) == "" || strings.TrimSpace(os.Getenv("MILVUS_ADDRESS")) == "" {
+		return
+	}
+
 	go func() {
 		bgCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
@@ -428,132 +431,4 @@ func persistEmbeddingAsync(productID, title, textToEmbed string) {
 
 		log.Printf("=> Successfully saved Product %s to Milvus Database!", productID)
 	}()
-}
-
-// 4. Orchestrator: Manual mapping here
-func AggregateProductData(upcCode string) (*models.FinalProductInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-
-	// 4.1. Fetch the product data from UPC (Contains links, prices, descriptions)
-	log.Println("[1] Fetching product data from UPC...")
-	seedData, err := fetchSeedData(ctx, upcCode)
-	if err != nil || len(seedData.Items) == 0 {
-		return nil, fmt.Errorf("UPC lookup failed: %v", err)
-	}
-	item := seedData.Items[0]
-
-	// 4.2. Initialize the return object and manually map the Seed data
-	finalResult := &models.FinalProductInfo{
-		ProductID: generateRandomID(),
-		ProductIdentity: models.ProductIdentity{
-			Title:    item.Title,
-			Brand:    item.Brand,
-			Model:    item.Model,
-			UPC:      upcCode,
-			Category: item.Category,
-		},
-		Description: item.Description,
-		TechSpecs:   make(map[string]string),
-		CommercialDetails: models.CommercialInfo{
-			Manufacturer: item.Brand,
-			Marketplaces: make([]models.Marketplace, 0),
-		},
-	}
-
-	// --> Map commercial data (Links, Average Price) from the Offers array <---
-	var totalPrice float64
-	var offerCount int
-	for _, offer := range item.Offers {
-		finalResult.CommercialDetails.Marketplaces = append(finalResult.CommercialDetails.Marketplaces, models.Marketplace{
-			StoreName:   offer.Merchant,
-			Price:       offer.Price,
-			Currency:    offer.Currency,
-			ProductLink: offer.Link,
-		})
-		totalPrice += offer.Price
-		offerCount++
-	}
-
-	// Calculate the average price
-	if offerCount > 0 {
-		finalResult.CommercialDetails.AveragePrice = totalPrice / float64(offerCount)
-	}
-
-	// 4.3. Fetch patent data
-	log.Println("[2] Fetching patent data from USPTO...")
-	var wg sync.WaitGroup
-	var patentData *models.PatentsViewResponse
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		data, err := fetchPatentData(ctx, item.Brand)
-		if err == nil {
-			patentData = data
-		} else {
-			log.Printf("Warning: patent fetch failed: %v", err)
-		}
-	}()
-	wg.Wait()
-
-	// 4.4. Manual mapping of patent data to technical specs
-	if patentData != nil && len(patentData.PatentFileWrapperDataBag) > 0 {
-		foundManufacturer, foundCountry, foundFilingDate, foundInventor := false, false, false, false
-
-		for _, patentItem := range patentData.PatentFileWrapperDataBag {
-			meta := patentItem.ApplicationMetaData
-
-			if !foundFilingDate && meta.FilingDate != "" {
-				finalResult.TechSpecs["patent_filing_date"] = meta.FilingDate
-				foundFilingDate = true
-			}
-
-			if !foundInventor && meta.FirstInventorName != "" {
-				finalResult.TechSpecs["key_inventor"] = meta.FirstInventorName
-				foundInventor = true
-			}
-
-			for _, applicant := range meta.ApplicantBag {
-				if !foundManufacturer && applicant.ApplicantNameText != "" {
-					finalResult.CommercialDetails.Manufacturer = applicant.ApplicantNameText
-					foundManufacturer = true
-				}
-
-				for _, address := range applicant.CorrespondenceAddressBag {
-					if !foundCountry && address.CountryName != "" {
-						finalResult.CommercialDetails.CountryOfOrigin = address.CountryName
-						foundCountry = true
-					}
-				}
-			}
-
-			if foundFilingDate && foundInventor && foundManufacturer && foundCountry {
-				break
-			}
-		}
-	}
-
-	// 4.5. Call LLM to do the complex part (Only Core Idea and Claim Charts)
-	log.Println("[3] Starting LLM synthesis for IP Analysis...")
-	llmAnalysis, err := synthesizeWithLLM(ctx, item.Description, patentData)
-	if err != nil {
-		return nil, fmt.Errorf("synthesis process failed: %v", err)
-	}
-
-	// 4.6. Merge the result from LLM into the Struct
-	finalResult.Description = llmAnalysis.PolishedDescription
-	finalResult.CoreInventionIdea = llmAnalysis.CoreInventionIdea
-	finalResult.IPAnalysis = llmAnalysis.IPAnalysis
-
-	// 4.7. Offload embedding generation and Milvus persistence off the critical path.
-	textToEmbed := fmt.Sprintf("Title: %s. Brand: %s. Core Idea: %s. Description: %s",
-		finalResult.ProductIdentity.Title,
-		finalResult.ProductIdentity.Brand,
-		finalResult.CoreInventionIdea,
-		finalResult.Description)
-
-	persistEmbeddingAsync(finalResult.ProductID, finalResult.ProductIdentity.Title, textToEmbed)
-
-	return finalResult, nil
 }
