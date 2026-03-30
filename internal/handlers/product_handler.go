@@ -32,6 +32,48 @@ func GetProductInfo(c *gin.Context) {
 	})
 }
 
+func GetCompanyProducts(c *gin.Context) {
+	company := strings.TrimSpace(c.Query("company"))
+	if company == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing 'company' query parameter"})
+		return
+	}
+
+	limit := 5
+	if rawLimit := strings.TrimSpace(c.Query("limit")); rawLimit != "" {
+		parsedLimit, err := strconv.Atoi(rawLimit)
+		if err != nil || parsedLimit <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'limit' query parameter"})
+			return
+		}
+		if parsedLimit > 10 {
+			parsedLimit = 10
+		}
+		limit = parsedLimit
+	}
+
+	offset := 0
+	if rawOffset := strings.TrimSpace(c.Query("offset")); rawOffset != "" {
+		parsedOffset, err := strconv.Atoi(rawOffset)
+		if err != nil || parsedOffset < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'offset' query parameter"})
+			return
+		}
+		offset = parsedOffset
+	}
+
+	productList, err := services.AggregateCompanyProducts(company, limit, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"data":   productList,
+	})
+}
+
 func SearchProducts(c *gin.Context) {
 	query := strings.TrimSpace(c.Query("query"))
 	if query == "" {

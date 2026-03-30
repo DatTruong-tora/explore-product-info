@@ -7,9 +7,13 @@ type FinalProductInfo struct {
 	CommercialDetails CommercialInfo    `json:"commercial_details"` // Thêm cục này vào
 	Description       string            `json:"product_description"`
 	CoreInventionIdea string            `json:"core_invention_idea"`
+	ReleaseDate       string            `json:"release_date,omitempty"`
+	Stage             string            `json:"stage,omitempty"`
+	Features          string            `json:"features,omitempty"`
+	Images            []string          `json:"images,omitempty"`
 	TechSpecs         map[string]string `json:"technical_specifications"`
 	IPAnalysis        IPAnalysisData    `json:"intellectual_property_analysis"`
-	Vector            []float32         `json:"vector"`
+	Vector            []float32         `json:"-"`
 }
 
 type CommercialInfo struct {
@@ -45,24 +49,47 @@ type ClaimChart struct {
 	Relevance     string `json:"invalidity_search_relevance"`
 }
 
-// 2. Struct for raw data returned by UPCitemdb.
-type UPCResponse struct {
-	Items []struct {
-		Title       string  `json:"title"`
-		Description string  `json:"description"`
-		Brand       string  `json:"brand"`
-		Model       string  `json:"model"`
-		Category    string  `json:"category"`
-		Offers      []Offer `json:"offers"`
-	} `json:"items"`
+// 2. Structs for raw data returned by UPCitemdb.
+type UPCItemDBResponse struct {
+	Code   string    `json:"code"`
+	Total  int       `json:"total"`
+	Offset int       `json:"offset"`
+	Items  []UPCItem `json:"items"`
 }
 
+type UPCItem struct {
+	EAN                  string   `json:"ean"`
+	UPC                  string   `json:"upc"`
+	GTIN                 string   `json:"gtin"`
+	Title                string   `json:"title"`
+	Description          string   `json:"description"`
+	Brand                string   `json:"brand"`
+	Model                string   `json:"model"`
+	Color                string   `json:"color"`
+	Size                 string   `json:"size"`
+	Dimension            string   `json:"dimension"`
+	Weight               string   `json:"weight"`
+	Category             string   `json:"category"`
+	Currency             string   `json:"currency"`
+	LowestRecordedPrice  float64  `json:"lowest_recorded_price"`
+	HighestRecordedPrice float64  `json:"highest_recorded_price"`
+	Images               []string `json:"images"`
+	Offers               []Offer  `json:"offers"`
+}
+
+type UPCResponse = UPCItemDBResponse
+
 type Offer struct {
-	Merchant string  `json:"merchant"`
-	Domain   string  `json:"domain"`
-	Price    float64 `json:"price"`
-	Currency string  `json:"currency"`
-	Link     string  `json:"link"`
+	Merchant     string  `json:"merchant"`
+	Domain       string  `json:"domain"`
+	Title        string  `json:"title"`
+	Price        float64 `json:"price"`
+	Currency     string  `json:"currency"`
+	Shipping     string  `json:"shipping"`
+	Condition    string  `json:"condition"`
+	Availability string  `json:"availability"`
+	Link         string  `json:"link"`
+	UpdatedAt    int64   `json:"updated_at"`
 }
 
 // 3. Struct for raw data returned by USPTO.
@@ -111,6 +138,34 @@ type LLMAnalysisResult struct {
 	PolishedDescription string         `json:"polished_description"`
 	CoreInventionIdea   string         `json:"core_invention_idea"`
 	IPAnalysis          IPAnalysisData `json:"intellectual_property_analysis"`
+}
+
+type ProductEnrichment struct {
+	ReleaseDate string   `json:"release_date,omitempty"`
+	Stage       string   `json:"stage,omitempty"`
+	Features    string   `json:"features,omitempty"`
+	Images      []string `json:"images,omitempty"`
+	Description string   `json:"description,omitempty"`
+}
+
+type CompanyProductsResponse struct {
+	Company  string             `json:"company"`
+	Total    int                `json:"total"`
+	Offset   int                `json:"offset"`
+	Limit    int                `json:"limit"`
+	Products []FinalProductInfo `json:"products"`
+}
+
+type SerpAPIShoppingResponse struct {
+	ShoppingResults []SerpAPIShoppingResult `json:"shopping_results"`
+}
+
+type SerpAPIShoppingResult struct {
+	Title      string   `json:"title"`
+	Snippet    string   `json:"snippet"`
+	Thumbnail  string   `json:"thumbnail"`
+	Source     string   `json:"source"`
+	Extensions []string `json:"extensions"`
 }
 
 type SearchMatch struct {
