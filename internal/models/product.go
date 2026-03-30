@@ -156,6 +156,17 @@ type CompanyProductsResponse struct {
 	Products []FinalProductInfo `json:"products"`
 }
 
+type RelatedPatentsResponse struct {
+	InventionText string   `json:"invention_text"`
+	Limit         int      `json:"limit"`
+	PatentIDs     []string `json:"patent_ids"`
+}
+
+type RelatedPatentsRequest struct {
+	InventionText string `json:"invention_text"`
+	Limit         int    `json:"limit"`
+}
+
 type SerpAPIShoppingResponse struct {
 	ShoppingResults []SerpAPIShoppingResult `json:"shopping_results"`
 }

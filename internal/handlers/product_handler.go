@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/DatTruong-tora/product-insight-api/internal/models"
 	"github.com/DatTruong-tora/product-insight-api/internal/services"
 	"github.com/gin-gonic/gin"
 )
@@ -113,5 +114,30 @@ func SearchProducts(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
 		"data":   searchResult,
+	})
+}
+
+func GetRelatedPatents(c *gin.Context) {
+	var request models.RelatedPatentsRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON request body"})
+		return
+	}
+
+	inventionText := strings.TrimSpace(request.InventionText)
+	if inventionText == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing 'invention_text' in request body"})
+		return
+	}
+
+	relatedPatents, err := services.FindRelatedPatentIDs(inventionText, request.Limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"data":   relatedPatents,
 	})
 }

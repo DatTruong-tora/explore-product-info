@@ -75,13 +75,12 @@ func fetchSeedData(ctx context.Context, upc string) (*models.UPCResponse, error)
 }
 
 // 2. Call the USPTO API.
-func fetchPatentData(ctx context.Context, brand string) (*models.PatentsViewResponse, error) {
+func fetchPatentDataBySearchText(ctx context.Context, searchText string) (*models.PatentsViewResponse, error) {
 	usptoKey := os.Getenv("USPTO_API_KEY")
 	if usptoKey == "" {
 		return nil, fmt.Errorf("missing USPTO_API_KEY environment variable")
 	}
 
-	searchText := fmt.Sprintf(`assignee:"%s"`, brand)
 	reqURL := fmt.Sprintf("https://api.uspto.gov/api/v1/patent/applications/search?searchText=%s", url.QueryEscape(searchText))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
@@ -109,6 +108,11 @@ func fetchPatentData(ctx context.Context, brand string) (*models.PatentsViewResp
 	}
 
 	return &data, nil
+}
+
+func fetchPatentData(ctx context.Context, brand string) (*models.PatentsViewResponse, error) {
+	searchText := fmt.Sprintf(`assignee:"%s"`, brand)
+	return fetchPatentDataBySearchText(ctx, searchText)
 }
 
 // 3. Call the  LLM API (Gemini) for synthesis.
