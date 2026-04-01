@@ -130,7 +130,7 @@ func GetRelatedPatents(c *gin.Context) {
 		return
 	}
 
-	relatedPatents, err := services.FindRelatedPatentIDs(inventionText, request.Limit)
+	relatedPatents, err := services.FindRelatedPatentIDs(c.Request.Context(), inventionText, request.Limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

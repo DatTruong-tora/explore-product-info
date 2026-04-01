@@ -107,8 +107,16 @@ func defaultProductDiscoveryProvider() productDiscoveryProvider {
 	return upcItemDBProvider{}
 }
 
+// SerpAPIKey returns the SerpAPI credential, preferring SERP_API_KEY over SERPAPI_API_KEY.
+func SerpAPIKey() string {
+	if k := strings.Trim(strings.TrimSpace(os.Getenv("SERP_API_KEY")), `"'`); k != "" {
+		return k
+	}
+	return strings.Trim(strings.TrimSpace(os.Getenv("SERPAPI_API_KEY")), `"'`)
+}
+
 func defaultProductDetailsProviders() []productDetailsProvider {
-	apiKey := strings.TrimSpace(os.Getenv("SERPAPI_API_KEY"))
+	apiKey := SerpAPIKey()
 	if apiKey == "" {
 		return nil
 	}
