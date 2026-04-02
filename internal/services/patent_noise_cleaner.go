@@ -16,7 +16,21 @@ const noiseCSVHeaderMarker = "Text Collection To Clean"
 var (
 	patentNoiseMu sync.RWMutex
 	patentNoiseRE *regexp.Regexp
+
+	// htmlTagPattern strips simple HTML-like tags (<p>, <div>, <br/>, etc.).
+	// Tags are replaced with a space so adjacent words do not merge.
+	htmlTagPattern = regexp.MustCompile(`<[^>]+>`)
 )
+
+// preprocessPatentInventionPlaintext removes HTML-like tags and literal
+// backslash-escape spellings (\n, \t, \r) often pasted from logs or JSON.
+func preprocessPatentInventionPlaintext(s string) string {
+	s = htmlTagPattern.ReplaceAllString(s, " ")
+	s = strings.ReplaceAll(s, `\n`, "")
+	s = strings.ReplaceAll(s, `\t`, "")
+	s = strings.ReplaceAll(s, `\r`, "")
+	return s
+}
 
 // InitializePatentNoiseCleaner reads noise phrases from csvPath once, builds a single
 // case-insensitive alternation regex (longest phrases first), and stores it for
@@ -119,6 +133,7 @@ func cleanPatentInventionNoise(s string) string {
 }
 
 func cleanPatentInventionNoiseWith(s string, re *regexp.Regexp) string {
+	s = preprocessPatentInventionPlaintext(s)
 	out := re.ReplaceAllString(s, " ")
 	return strings.TrimSpace(strings.Join(strings.Fields(out), " "))
 }
