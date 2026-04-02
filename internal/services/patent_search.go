@@ -15,14 +15,53 @@ import (
 const (
 	defaultRelatedPatentLimit = 10
 	maxRelatedPatentLimit     = 1000
+
+	patentProviderUSPTO   = "uspto"
+	patentProviderSerpAPI = "serpapi"
 )
 
-// FindRelatedPatentIDs resolves related patent identifiers from USPTO (when USPTO_API_KEY is set)
-// and SerpAPI Google Patents (when SERP_API_KEY or SERPAPI_API_KEY is set). Sources run concurrently;
-// if one fails and the other succeeds, results from the successful source are returned.
+func usptoAPIKeyConfigured() bool {
+	return strings.Trim(strings.TrimSpace(os.Getenv("USPTO_API_KEY")), `"'`) != ""
+}
+
+// PatentProvider is a registered patent ID source. Add new backends by appending
+// to activePatentProviders(); core orchestration stays in executePatentProviderSearch.
+type PatentProvider struct {
+	Name  string
+	Fetch func(ctx context.Context, inventionText string, limit int) ([]string, error)
+}
+
+// activePatentProviders returns providers enabled by environment variables.
+func activePatentProviders() []PatentProvider {
+	var out []PatentProvider
+	if usptoAPIKeyConfigured() {
+		out = append(out, PatentProvider{
+			Name: patentProviderUSPTO,
+			Fetch: func(ctx context.Context, inventionText string, limit int) ([]string, error) {
+				return collectUSPTOPatentIDs(ctx, inventionText, limit)
+			},
+		})
+	}
+	serpKey := SerpAPIKey()
+	if strings.TrimSpace(serpKey) != "" {
+		key := serpKey
+		out = append(out, PatentProvider{
+			Name: patentProviderSerpAPI,
+			Fetch: func(ctx context.Context, inventionText string, limit int) ([]string, error) {
+				return fetchSerpAPIRelatedPatentIDs(ctx, key, inventionText, limit)
+			},
+		})
+	}
+	return out
+}
+
+// FindRelatedPatentIDs resolves related patent identifiers from enabled providers
+// (USPTO when USPTO_API_KEY is set; SerpAPI Google Patents when SERP_API_KEY or
+// SERPAPI_API_KEY is set). Providers run concurrently; partial failures are logged
+// and ignored if at least one provider succeeds.
 func FindRelatedPatentIDs(ctx context.Context, inventionText string, limit int) (*models.RelatedPatentsResponse, error) {
-	trimmedText := strings.TrimSpace(inventionText)
-	if trimmedText == "" {
+	inventionText = cleanPatentInventionNoise(inventionText)
+	if inventionText == "" {
 		return nil, fmt.Errorf("invention text is required")
 	}
 
@@ -33,75 +72,69 @@ func FindRelatedPatentIDs(ctx context.Context, inventionText string, limit int) 
 		limit = maxRelatedPatentLimit
 	}
 
+	providers := activePatentProviders()
+	if len(providers) == 0 {
+		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY and/or SERP_API_KEY (or SERPAPI_API_KEY)")
+	}
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
-	usptoConfigured := strings.TrimSpace(os.Getenv("USPTO_API_KEY")) != ""
-	serpKey := SerpAPIKey()
-	serpConfigured := serpKey != ""
+	return executePatentProviderSearch(ctx, inventionText, limit, providers)
+}
 
-	if !usptoConfigured && !serpConfigured {
+// executePatentProviderSearch runs all providers concurrently and merges results.
+// Exposed to tests in this package via same-name calls with injected providers.
+func executePatentProviderSearch(ctx context.Context, inventionText string, limit int, providers []PatentProvider) (*models.RelatedPatentsResponse, error) {
+	if len(providers) == 0 {
 		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY and/or SERP_API_KEY (or SERPAPI_API_KEY)")
 	}
 
+	type outcome struct {
+		name string
+		ids  []string
+		err  error
+	}
+	outcomes := make([]outcome, len(providers))
+
 	var wg sync.WaitGroup
-	var usptoIDs []string
-	var usptoErr error
-	var serpIDs []string
-	var serpErr error
-
-	if usptoConfigured {
+	for i := range providers {
+		i := i
+		p := providers[i]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			usptoIDs, usptoErr = collectUSPTOPatentIDs(ctx, trimmedText, limit)
+			ids, err := p.Fetch(ctx, inventionText, limit)
+			outcomes[i] = outcome{name: p.Name, ids: ids, err: err}
 		}()
 	}
-
-	if serpConfigured {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			serpIDs, serpErr = fetchSerpAPIRelatedPatentIDs(ctx, serpKey, trimmedText, limit)
-		}()
-	}
-
 	wg.Wait()
 
-	if err := relatedPatentsSourceFailure(usptoConfigured, serpConfigured, usptoErr, serpErr); err != nil {
-		return nil, err
-	}
-	if usptoErr != nil {
-		log.Printf("related patent search partial failure: USPTO source failed: %v", usptoErr)
-	}
-	if serpErr != nil {
-		log.Printf("related patent search partial failure: SerpAPI source failed: %v", serpErr)
+	var failMsgs []string
+	var successSlices [][]string
+	for _, o := range outcomes {
+		if o.err != nil {
+			log.Printf("related patent search partial failure: provider %q failed: %v", o.name, o.err)
+			failMsgs = append(failMsgs, fmt.Sprintf("%s: %v", o.name, o.err))
+			continue
+		}
+		successSlices = append(successSlices, o.ids)
 	}
 
-	merged := mergeRelatedPatentIDs(usptoIDs, serpIDs, limit)
+	if len(successSlices) == 0 {
+		return nil, fmt.Errorf("patent search failed: all %d providers failed (%s)", len(providers), strings.Join(failMsgs, "; "))
+	}
+
+	merged := mergeRelatedPatentIDs(limit, successSlices...)
 
 	return &models.RelatedPatentsResponse{
-		InventionText: trimmedText,
+		InventionText: inventionText,
 		Limit:         limit,
 		PatentIDs:     merged,
 	}, nil
-}
-
-func relatedPatentsSourceFailure(usptoConfigured, serpConfigured bool, usptoErr, serpErr error) error {
-	switch {
-	case usptoConfigured && !serpConfigured:
-		return usptoErr
-	case !usptoConfigured && serpConfigured:
-		return serpErr
-	default:
-		if usptoErr != nil && serpErr != nil {
-			return fmt.Errorf("patent search failed: USPTO: %v; SerpAPI: %v", usptoErr, serpErr)
-		}
-		return nil
-	}
 }
 
 func collectUSPTOPatentIDs(ctx context.Context, inventionText string, limit int) ([]string, error) {
@@ -148,9 +181,23 @@ func collectUSPTOPatentIDs(ctx context.Context, inventionText string, limit int)
 	return out, nil
 }
 
-func mergeRelatedPatentIDs(uspto, serp []string, limit int) []string {
+// mergeRelatedPatentIDs interleaves patent IDs from N sources in round-robin order
+// (fair exposure of top ranks across providers), then dedupes using normalizePatentIDKey.
+func mergeRelatedPatentIDs(limit int, sources ...[]string) []string {
+	if limit <= 0 || len(sources) == 0 {
+		return nil
+	}
+
+	maxRound := 0
+	for _, s := range sources {
+		if n := len(s); n > maxRound {
+			maxRound = n
+		}
+	}
+
 	seen := make(map[string]struct{}, limit)
 	out := make([]string, 0, limit)
+
 	add := func(raw string) {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
@@ -166,18 +213,16 @@ func mergeRelatedPatentIDs(uspto, serp []string, limit int) []string {
 		seen[key] = struct{}{}
 		out = append(out, raw)
 	}
-	for _, id := range uspto {
-		if len(out) >= limit {
-			return out
+
+	for round := 0; round < maxRound && len(out) < limit; round++ {
+		for si := 0; si < len(sources) && len(out) < limit; si++ {
+			if round >= len(sources[si]) {
+				continue
+			}
+			add(sources[si][round])
 		}
-		add(id)
 	}
-	for _, id := range serp {
-		if len(out) >= limit {
-			break
-		}
-		add(id)
-	}
+
 	return out
 }
 
