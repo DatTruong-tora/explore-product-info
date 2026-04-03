@@ -2,8 +2,13 @@ package services
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -19,10 +24,26 @@ const (
 	patentProviderUSPTO   = "uspto"
 	patentProviderSerpAPI = "serpapi"
 	patentProviderLens    = "lens"
+	patentProviderEPO     = "epo"
+)
+
+// EPO OPS OAuth and search endpoints (overridable in tests).
+var (
+	epoOPSAuthURL   = "https://ops.epo.org/3.2/auth/accesstoken"
+	epoOPSSearchURL = "https://ops.epo.org/3.2/rest-services/published-data/search"
 )
 
 func usptoAPIKeyConfigured() bool {
 	return strings.Trim(strings.TrimSpace(os.Getenv("USPTO_API_KEY")), `"'`) != ""
+}
+
+func epoOPSConsumerCredentials() (consumerKey, consumerSecret string, ok bool) {
+	consumerKey = strings.Trim(strings.TrimSpace(os.Getenv("EPO_CONSUMER_KEY")), `"'`)
+	consumerSecret = strings.Trim(strings.TrimSpace(os.Getenv("EPO_CONSUMER_SECRET_KEY")), `"'`)
+	if consumerKey == "" || consumerSecret == "" {
+		return "", "", false
+	}
+	return consumerKey, consumerSecret, true
 }
 
 // PatentProvider is a registered patent ID source. Add new backends by appending
@@ -63,12 +84,22 @@ func activePatentProviders() []PatentProvider {
 			},
 		})
 	}
+	if ck, cs, ok := epoOPSConsumerCredentials(); ok {
+		consumerKey, consumerSecret := ck, cs
+		out = append(out, PatentProvider{
+			Name: patentProviderEPO,
+			Fetch: func(ctx context.Context, inventionText string, limit int) ([]string, error) {
+				return fetchEPORelatedPatentIDs(ctx, consumerKey, consumerSecret, inventionText, limit)
+			},
+		})
+	}
 	return out
 }
 
 // FindRelatedPatentIDs resolves related patent identifiers from enabled providers
 // (USPTO when USPTO_API_KEY is set; SerpAPI Google Patents when SERP_API_KEY or
-// SERPAPI_API_KEY is set; Lens.org when LENS_API_KEY is set). Providers run
+// SERPAPI_API_KEY is set; Lens.org when LENS_API_KEY is set; EPO OPS when
+// EPO_CONSUMER_KEY and EPO_CONSUMER_SECRET_KEY are set). Providers run
 // concurrently; partial failures are logged and ignored if at least one provider succeeds.
 func FindRelatedPatentIDs(ctx context.Context, inventionText string, limit int) (*models.RelatedPatentsResponse, error) {
 	inventionText = cleanPatentInventionNoise(inventionText)
@@ -85,7 +116,7 @@ func FindRelatedPatentIDs(ctx context.Context, inventionText string, limit int) 
 
 	providers := activePatentProviders()
 	if len(providers) == 0 {
-		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY, SERP_API_KEY (or SERPAPI_API_KEY), and/or LENS_API_KEY")
+		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY, SERP_API_KEY (or SERPAPI_API_KEY), LENS_API_KEY, and/or EPO_CONSUMER_KEY with EPO_CONSUMER_SECRET_KEY")
 	}
 
 	if ctx == nil {
@@ -101,7 +132,7 @@ func FindRelatedPatentIDs(ctx context.Context, inventionText string, limit int) 
 // Exposed to tests in this package via same-name calls with injected providers.
 func executePatentProviderSearch(ctx context.Context, inventionText string, limit int, providers []PatentProvider) (*models.RelatedPatentsResponse, error) {
 	if len(providers) == 0 {
-		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY, SERP_API_KEY (or SERPAPI_API_KEY), and/or LENS_API_KEY")
+		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY, SERP_API_KEY (or SERPAPI_API_KEY), LENS_API_KEY, and/or EPO_CONSUMER_KEY with EPO_CONSUMER_SECRET_KEY")
 	}
 
 	type outcome struct {
@@ -311,4 +342,281 @@ func extractPatentSearchTerms(inventionText string) []string {
 	}
 
 	return result
+}
+
+// --- EPO OPS (published-data search) ---
+
+type epoTokenResponse struct {
+	AccessToken string `json:"access_token"`
+}
+
+// epoJSONText decodes EPO JSON text nodes encoded as {"$":"value"}.
+type epoJSONText struct {
+	Dollar string `json:"$"`
+}
+
+func epoJSONTextString(t epoJSONText) string {
+	return strings.TrimSpace(t.Dollar)
+}
+
+// epoSearchDocumentID is one document-id block under publication-reference (OPS JSON).
+type epoSearchDocumentID struct {
+	DocumentIDType string      `json:"@document-id-type"`
+	Country        epoJSONText `json:"country"`
+	DocNumber      epoJSONText `json:"doc-number"`
+	Kind           epoJSONText `json:"kind"`
+}
+
+func (d *epoSearchDocumentID) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		DocumentIDType string      `json:"@document-id-type"`
+		Country        epoJSONText `json:"country"`
+		DocNumber      epoJSONText `json:"doc-number"`
+		Kind           epoJSONText `json:"kind"`
+		CountryOp      epoJSONText `json:"ops:country"`
+		DocNumOp       epoJSONText `json:"ops:doc-number"`
+		KindOp         epoJSONText `json:"ops:kind"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	d.DocumentIDType = raw.DocumentIDType
+	d.Country = raw.Country
+	if epoJSONTextString(d.Country) == "" {
+		d.Country = raw.CountryOp
+	}
+	d.DocNumber = raw.DocNumber
+	if epoJSONTextString(d.DocNumber) == "" {
+		d.DocNumber = raw.DocNumOp
+	}
+	d.Kind = raw.Kind
+	if epoJSONTextString(d.Kind) == "" {
+		d.Kind = raw.KindOp
+	}
+	return nil
+}
+
+// epoDocumentIDList unmarshals a single object or array of document-id nodes.
+type epoDocumentIDList []epoSearchDocumentID
+
+func (d *epoDocumentIDList) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 || string(b) == "null" {
+		return nil
+	}
+	if b[0] == '[' {
+		var arr []epoSearchDocumentID
+		if err := json.Unmarshal(b, &arr); err != nil {
+			return err
+		}
+		*d = arr
+		return nil
+	}
+	var one epoSearchDocumentID
+	if err := json.Unmarshal(b, &one); err != nil {
+		return err
+	}
+	*d = []epoSearchDocumentID{one}
+	return nil
+}
+
+// epoPublicationReference is ops:publication-reference in search-result.
+type epoPublicationReference struct {
+	DocumentID epoDocumentIDList `json:"ops:document-id"`
+}
+
+// epoPublicationRefList unmarshals a single publication-reference or an array.
+type epoPublicationRefList []epoPublicationReference
+
+func (p *epoPublicationRefList) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 || string(b) == "null" {
+		return nil
+	}
+	if b[0] == '[' {
+		var arr []epoPublicationReference
+		if err := json.Unmarshal(b, &arr); err != nil {
+			return err
+		}
+		*p = arr
+		return nil
+	}
+	var one epoPublicationReference
+	if err := json.Unmarshal(b, &one); err != nil {
+		return err
+	}
+	*p = []epoPublicationReference{one}
+	return nil
+}
+
+type epoSearchResultNode struct {
+	PublicationReference epoPublicationRefList `json:"ops:publication-reference"`
+}
+
+type epoBiblioSearchNode struct {
+	SearchResult epoSearchResultNode `json:"ops:search-result"`
+}
+
+type epoWorldPatentData struct {
+	BiblioSearch epoBiblioSearchNode `json:"ops:biblio-search"`
+}
+
+type epoSearchResponseRoot struct {
+	WorldPatentData epoWorldPatentData `json:"ops:world-patent-data"`
+}
+
+func getEPOAccessToken(ctx context.Context, consumerKey, consumerSecret string) (string, error) {
+	form := url.Values{}
+	form.Set("grant_type", "client_credentials")
+	body := strings.NewReader(form.Encode())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, epoOPSAuthURL, body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	creds := base64.StdEncoding.EncodeToString([]byte(consumerKey + ":" + consumerSecret))
+	req.Header.Set("Authorization", "Basic "+creds)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("EPO OPS token endpoint returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var tr epoTokenResponse
+	if err := json.Unmarshal(raw, &tr); err != nil {
+		return "", fmt.Errorf("decode EPO OPS token response: %w", err)
+	}
+	if strings.TrimSpace(tr.AccessToken) == "" {
+		return "", fmt.Errorf("EPO OPS token response missing access_token")
+	}
+	return tr.AccessToken, nil
+}
+
+func epoSearchRangeEnd(limit int) int {
+	const max = 100
+	if limit <= 0 {
+		return max
+	}
+	if limit > max {
+		return max
+	}
+	return limit
+}
+
+func patentIDFromEPODocumentID(d epoSearchDocumentID) (string, bool) {
+	country := epoJSONTextString(d.Country)
+	docNum := epoJSONTextString(d.DocNumber)
+	kind := epoJSONTextString(d.Kind)
+	if country == "" || docNum == "" {
+		return "", false
+	}
+	return country + docNum + kind, true
+}
+
+func collectPatentIDsFromEPOSearchResult(refs epoPublicationRefList, limit int) []string {
+	if limit <= 0 {
+		limit = 100
+	}
+	seen := make(map[string]struct{}, limit)
+	out := make([]string, 0, limit)
+
+	add := func(id string) {
+		key := normalizePatentIDKey(id)
+		if key == "" {
+			return
+		}
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, id)
+	}
+
+	for _, pref := range refs {
+		if len(out) >= limit {
+			break
+		}
+		ids := pref.DocumentID
+		var chosen string
+		for _, did := range ids {
+			typ := strings.TrimSpace(did.DocumentIDType)
+			id, ok := patentIDFromEPODocumentID(did)
+			if !ok {
+				continue
+			}
+			if typ == "docdb" {
+				chosen = id
+				break
+			}
+			if chosen == "" {
+				chosen = id
+			}
+		}
+		if chosen != "" {
+			add(chosen)
+		}
+	}
+	return out
+}
+
+func fetchEPORelatedPatentIDs(ctx context.Context, consumerKey, consumerSecret, inventionText string, limit int) ([]string, error) {
+	keywords := extractPatentSearchTerms(inventionText)
+	if len(keywords) == 0 {
+		return nil, nil
+	}
+	q := strings.Join(keywords, " ")
+	if strings.TrimSpace(q) == "" {
+		return nil, nil
+	}
+
+	token, err := getEPOAccessToken(ctx, consumerKey, consumerSecret)
+	if err != nil {
+		return nil, err
+	}
+
+	rangeEnd := epoSearchRangeEnd(limit)
+	params := url.Values{}
+	params.Set("q", q)
+	params.Set("Range", fmt.Sprintf("1-%d", rangeEnd))
+	reqURL := epoOPSSearchURL + "?" + params.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Range", fmt.Sprintf("1-%d", rangeEnd))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("EPO OPS search returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var root epoSearchResponseRoot
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil, fmt.Errorf("decode EPO OPS search response: %w", err)
+	}
+	refs := root.WorldPatentData.BiblioSearch.SearchResult.PublicationReference
+
+	collLimit := limit
+	if collLimit <= 0 {
+		collLimit = 100
+	}
+
+	return collectPatentIDsFromEPOSearchResult(refs, collLimit), nil
 }
