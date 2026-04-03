@@ -18,6 +18,7 @@ const (
 
 	patentProviderUSPTO   = "uspto"
 	patentProviderSerpAPI = "serpapi"
+	patentProviderLens    = "lens"
 )
 
 func usptoAPIKeyConfigured() bool {
@@ -52,13 +53,23 @@ func activePatentProviders() []PatentProvider {
 			},
 		})
 	}
+	lensKey := strings.Trim(strings.TrimSpace(os.Getenv("LENS_API_KEY")), `"'`)
+	if lensKey != "" {
+		key := lensKey
+		out = append(out, PatentProvider{
+			Name: patentProviderLens,
+			Fetch: func(ctx context.Context, inventionText string, limit int) ([]string, error) {
+				return fetchLensOrgRelatedPatentIDs(ctx, key, inventionText, limit)
+			},
+		})
+	}
 	return out
 }
 
 // FindRelatedPatentIDs resolves related patent identifiers from enabled providers
 // (USPTO when USPTO_API_KEY is set; SerpAPI Google Patents when SERP_API_KEY or
-// SERPAPI_API_KEY is set). Providers run concurrently; partial failures are logged
-// and ignored if at least one provider succeeds.
+// SERPAPI_API_KEY is set; Lens.org when LENS_API_KEY is set). Providers run
+// concurrently; partial failures are logged and ignored if at least one provider succeeds.
 func FindRelatedPatentIDs(ctx context.Context, inventionText string, limit int) (*models.RelatedPatentsResponse, error) {
 	inventionText = cleanPatentInventionNoise(inventionText)
 	if inventionText == "" {
@@ -74,7 +85,7 @@ func FindRelatedPatentIDs(ctx context.Context, inventionText string, limit int) 
 
 	providers := activePatentProviders()
 	if len(providers) == 0 {
-		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY and/or SERP_API_KEY (or SERPAPI_API_KEY)")
+		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY, SERP_API_KEY (or SERPAPI_API_KEY), and/or LENS_API_KEY")
 	}
 
 	if ctx == nil {
@@ -90,7 +101,7 @@ func FindRelatedPatentIDs(ctx context.Context, inventionText string, limit int) 
 // Exposed to tests in this package via same-name calls with injected providers.
 func executePatentProviderSearch(ctx context.Context, inventionText string, limit int, providers []PatentProvider) (*models.RelatedPatentsResponse, error) {
 	if len(providers) == 0 {
-		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY and/or SERP_API_KEY (or SERPAPI_API_KEY)")
+		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY, SERP_API_KEY (or SERPAPI_API_KEY), and/or LENS_API_KEY")
 	}
 
 	type outcome struct {
@@ -167,9 +178,7 @@ func collectUSPTOPatentIDs(ctx context.Context, inventionText string, limit int)
 			}
 			seen[key] = struct{}{}
 			out = append(out, patentID)
-			log.Printf("USPTO patent ID: %s", patentID)
 			if len(out) >= limit {
-				log.Printf("USPTO patent IDs: %v", out)
 				return out, nil
 			}
 		}
