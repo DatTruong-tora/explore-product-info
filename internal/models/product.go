@@ -163,8 +163,9 @@ type RelatedPatentsResponse struct {
 }
 
 type RelatedPatentsRequest struct {
-	InventionText string `json:"invention_text"`
-	Limit         int    `json:"limit"`
+	InventionText string   `json:"invention_text"`
+	KeyPhrases    []string `json:"key_phrases"`
+	Limit         int      `json:"limit"`
 }
 
 type SerpAPIShoppingResponse struct {

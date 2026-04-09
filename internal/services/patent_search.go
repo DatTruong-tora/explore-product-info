@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -50,7 +51,7 @@ func epoOPSConsumerCredentials() (consumerKey, consumerSecret string, ok bool) {
 // to activePatentProviders(); core orchestration stays in executePatentProviderSearch.
 type PatentProvider struct {
 	Name  string
-	Fetch func(ctx context.Context, inventionText string, limit int) ([]string, error)
+	Fetch func(ctx context.Context, inventionText string, keyPhrases []string, limit int) ([]string, error)
 }
 
 // activePatentProviders returns providers enabled by environment variables.
@@ -59,8 +60,8 @@ func activePatentProviders() []PatentProvider {
 	if usptoAPIKeyConfigured() {
 		out = append(out, PatentProvider{
 			Name: patentProviderUSPTO,
-			Fetch: func(ctx context.Context, inventionText string, limit int) ([]string, error) {
-				return collectUSPTOPatentIDs(ctx, inventionText, limit)
+			Fetch: func(ctx context.Context, inventionText string, keyPhrases []string, limit int) ([]string, error) {
+				return collectUSPTOPatentIDs(ctx, inventionText, keyPhrases, limit)
 			},
 		})
 	}
@@ -69,8 +70,8 @@ func activePatentProviders() []PatentProvider {
 		key := serpKey
 		out = append(out, PatentProvider{
 			Name: patentProviderSerpAPI,
-			Fetch: func(ctx context.Context, inventionText string, limit int) ([]string, error) {
-				return fetchSerpAPIRelatedPatentIDs(ctx, key, inventionText, limit)
+			Fetch: func(ctx context.Context, inventionText string, keyPhrases []string, limit int) ([]string, error) {
+				return fetchSerpAPIRelatedPatentIDs(ctx, key, inventionText, keyPhrases, limit)
 			},
 		})
 	}
@@ -79,8 +80,8 @@ func activePatentProviders() []PatentProvider {
 		key := lensKey
 		out = append(out, PatentProvider{
 			Name: patentProviderLens,
-			Fetch: func(ctx context.Context, inventionText string, limit int) ([]string, error) {
-				return fetchLensOrgRelatedPatentIDs(ctx, key, inventionText, limit)
+			Fetch: func(ctx context.Context, inventionText string, keyPhrases []string, limit int) ([]string, error) {
+				return fetchLensOrgRelatedPatentIDs(ctx, key, inventionText, keyPhrases, limit)
 			},
 		})
 	}
@@ -88,8 +89,8 @@ func activePatentProviders() []PatentProvider {
 		consumerKey, consumerSecret := ck, cs
 		out = append(out, PatentProvider{
 			Name: patentProviderEPO,
-			Fetch: func(ctx context.Context, inventionText string, limit int) ([]string, error) {
-				return fetchEPORelatedPatentIDs(ctx, consumerKey, consumerSecret, inventionText, limit)
+			Fetch: func(ctx context.Context, inventionText string, keyPhrases []string, limit int) ([]string, error) {
+				return fetchEPORelatedPatentIDs(ctx, consumerKey, consumerSecret, keyPhrases, limit)
 			},
 		})
 	}
@@ -101,10 +102,19 @@ func activePatentProviders() []PatentProvider {
 // SERPAPI_API_KEY is set; Lens.org when LENS_API_KEY is set; EPO OPS when
 // EPO_CONSUMER_KEY and EPO_CONSUMER_SECRET_KEY are set). Providers run
 // concurrently; partial failures are logged and ignored if at least one provider succeeds.
-func FindRelatedPatentIDs(ctx context.Context, inventionText string, limit int) (*models.RelatedPatentsResponse, error) {
+// keyPhrases is normalized and, when empty, derived from cleaned inventionText via
+// extractFallbackKeywords so remote APIs receive compact queries instead of long prose.
+func FindRelatedPatentIDs(ctx context.Context, inventionText string, keyPhrases []string, limit int) (*models.RelatedPatentsResponse, error) {
 	inventionText = cleanPatentInventionNoise(inventionText)
-	if inventionText == "" {
-		return nil, fmt.Errorf("invention text is required")
+	keyPhrases = normalizeKeyPhrases(keyPhrases)
+
+	if len(keyPhrases) == 0 && inventionText != "" {
+		log.Printf("No key_phrases provided, using auto-extracted fallback keywords.")
+		keyPhrases = extractFallbackKeywords(inventionText)
+	}
+
+	if len(keyPhrases) == 0 && inventionText == "" {
+		return nil, fmt.Errorf("no usable search terms: provide key_phrases and/or invention_text with substantive content after noise cleaning")
 	}
 
 	if limit <= 0 {
@@ -125,12 +135,12 @@ func FindRelatedPatentIDs(ctx context.Context, inventionText string, limit int) 
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
-	return executePatentProviderSearch(ctx, inventionText, limit, providers)
+	return executePatentProviderSearch(ctx, inventionText, keyPhrases, limit, providers)
 }
 
 // executePatentProviderSearch runs all providers concurrently and merges results.
 // Exposed to tests in this package via same-name calls with injected providers.
-func executePatentProviderSearch(ctx context.Context, inventionText string, limit int, providers []PatentProvider) (*models.RelatedPatentsResponse, error) {
+func executePatentProviderSearch(ctx context.Context, inventionText string, keyPhrases []string, limit int, providers []PatentProvider) (*models.RelatedPatentsResponse, error) {
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("no patent search configured: set USPTO_API_KEY, SERP_API_KEY (or SERPAPI_API_KEY), LENS_API_KEY, and/or EPO_CONSUMER_KEY with EPO_CONSUMER_SECRET_KEY")
 	}
@@ -149,7 +159,7 @@ func executePatentProviderSearch(ctx context.Context, inventionText string, limi
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ids, err := p.Fetch(ctx, inventionText, limit)
+			ids, err := p.Fetch(ctx, inventionText, keyPhrases, limit)
 			outcomes[i] = outcome{name: p.Name, ids: ids, err: err}
 		}()
 	}
@@ -179,13 +189,13 @@ func executePatentProviderSearch(ctx context.Context, inventionText string, limi
 	}, nil
 }
 
-func collectUSPTOPatentIDs(ctx context.Context, inventionText string, limit int) ([]string, error) {
+func collectUSPTOPatentIDs(ctx context.Context, inventionText string, keyPhrases []string, limit int) ([]string, error) {
 	seen := make(map[string]struct{}, limit)
 	out := make([]string, 0, limit)
 	var lastErr error
 	anySuccess := false
 
-	for _, query := range buildPatentSearchQueries(inventionText) {
+	for _, query := range buildPatentSearchQueries(inventionText, keyPhrases) {
 		if len(out) >= limit {
 			break
 		}
@@ -286,9 +296,105 @@ func normalizePatentIDKey(s string) string {
 	return b.String()
 }
 
-func buildPatentSearchQueries(inventionText string) []string {
-	queries := make([]string, 0, 3)
-	seen := make(map[string]struct{}, 3)
+func normalizeKeyPhrases(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		k := strings.ToLower(s)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// patentFallbackStopwords filters low-information tokens during auto keyword extraction.
+var patentFallbackStopwords = map[string]struct{}{
+	"a": {}, "an": {}, "and": {}, "are": {}, "as": {}, "at": {}, "be": {}, "been": {}, "by": {},
+	"for": {}, "from": {}, "has": {}, "have": {}, "in": {}, "into": {}, "is": {}, "it": {},
+	"its": {}, "of": {}, "on": {}, "or": {}, "that": {}, "the": {}, "their": {}, "this": {},
+	"to": {}, "was": {}, "were": {}, "which": {}, "with": {}, "without": {}, "using": {},
+}
+
+func extractFallbackKeywords(text string) []string {
+	normalized := strings.NewReplacer(
+		",", " ", ".", " ", ";", " ", ":", " ", "-", " ", "_", " ", "/", " ",
+		"(", " ", ")", " ", "[", " ", "]", " ", "{", " ", "}", " ",
+	).Replace(strings.ToLower(text))
+	words := strings.Fields(normalized)
+
+	counts := make(map[string]int)
+	for _, w := range words {
+		if len(w) < 3 {
+			continue
+		}
+		if _, ok := patentFallbackStopwords[w]; ok {
+			continue
+		}
+		counts[w]++
+	}
+
+	type wc struct {
+		w string
+		n int
+	}
+	pairs := make([]wc, 0, len(counts))
+	for w, n := range counts {
+		pairs = append(pairs, wc{w: w, n: n})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].n != pairs[j].n {
+			return pairs[i].n > pairs[j].n
+		}
+		return pairs[i].w < pairs[j].w
+	})
+
+	const maxKW = 7
+	n := len(pairs)
+	if n > maxKW {
+		n = maxKW
+	}
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, pairs[i].w)
+	}
+	return out
+}
+
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	s = strings.TrimSpace(s)
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return strings.TrimSpace(string(runes[:max]))
+}
+
+func quoteUSPTOPatentPhrase(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	p = strings.ReplaceAll(p, `"`, " ")
+	p = strings.Join(strings.Fields(p), " ")
+	if strings.ContainsAny(p, " \t") {
+		return `"` + p + `"`
+	}
+	return p
+}
+
+func buildPatentSearchQueries(inventionText string, keyPhrases []string) []string {
+	queries := make([]string, 0, 5)
+	seen := make(map[string]struct{}, 5)
 
 	add := func(query string) {
 		query = strings.TrimSpace(query)
@@ -302,46 +408,30 @@ func buildPatentSearchQueries(inventionText string) []string {
 		queries = append(queries, query)
 	}
 
-	add(fmt.Sprintf(`inventionTitle:"%s"`, inventionText))
-	add(fmt.Sprintf(`"%s"`, inventionText))
+	var andParts []string
+	for _, kp := range keyPhrases {
+		q := quoteUSPTOPatentPhrase(kp)
+		if q != "" {
+			andParts = append(andParts, q)
+		}
+	}
+	if len(andParts) > 0 {
+		add(strings.Join(andParts, " AND "))
+	}
+	if len(andParts) > 1 {
+		add(strings.Join(andParts, " OR "))
+	}
 
-	keyTerms := extractPatentSearchTerms(inventionText)
-	if len(keyTerms) > 0 {
-		add(strings.Join(keyTerms, " AND "))
+	if inventionText != "" {
+		snippet := truncateRunes(inventionText, 200)
+		if snippet != "" {
+			esc := strings.ReplaceAll(snippet, `"`, " ")
+			add(fmt.Sprintf(`inventionTitle:"%s"`, esc))
+			add(fmt.Sprintf(`"%s"`, esc))
+		}
 	}
 
 	return queries
-}
-
-func extractPatentSearchTerms(inventionText string) []string {
-	stopwords := map[string]struct{}{
-		"a": {}, "an": {}, "and": {}, "for": {}, "from": {}, "in": {}, "into": {}, "of": {},
-		"on": {}, "or": {}, "the": {}, "to": {}, "with": {}, "without": {}, "using": {},
-	}
-
-	normalized := strings.NewReplacer(",", " ", ".", " ", ";", " ", ":", " ", "-", " ", "_", " ", "/", " ").Replace(strings.ToLower(inventionText))
-	terms := strings.Fields(normalized)
-
-	result := make([]string, 0, 5)
-	seen := make(map[string]struct{}, 5)
-	for _, term := range terms {
-		if len(term) < 3 {
-			continue
-		}
-		if _, ok := stopwords[term]; ok {
-			continue
-		}
-		if _, ok := seen[term]; ok {
-			continue
-		}
-		seen[term] = struct{}{}
-		result = append(result, term)
-		if len(result) == 5 {
-			break
-		}
-	}
-
-	return result
 }
 
 // --- EPO OPS (published-data search) ---
@@ -565,12 +655,18 @@ func collectPatentIDsFromEPOSearchResult(refs epoPublicationRefList, limit int) 
 	return out
 }
 
-func fetchEPORelatedPatentIDs(ctx context.Context, consumerKey, consumerSecret, inventionText string, limit int) ([]string, error) {
-	keywords := extractPatentSearchTerms(inventionText)
-	if len(keywords) == 0 {
+func fetchEPORelatedPatentIDs(ctx context.Context, consumerKey, consumerSecret string, keyPhrases []string, limit int) ([]string, error) {
+	if len(keyPhrases) == 0 {
 		return nil, nil
 	}
-	q := strings.Join(keywords, " ")
+	var qParts []string
+	for _, kp := range keyPhrases {
+		kp = strings.TrimSpace(kp)
+		if kp != "" {
+			qParts = append(qParts, kp)
+		}
+	}
+	q := strings.Join(qParts, " ")
 	if strings.TrimSpace(q) == "" {
 		return nil, nil
 	}

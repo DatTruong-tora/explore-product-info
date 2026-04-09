@@ -125,12 +125,20 @@ func GetRelatedPatents(c *gin.Context) {
 	}
 
 	inventionText := strings.TrimSpace(request.InventionText)
-	if inventionText == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing 'invention_text' in request body"})
+	keyPhrases := make([]string, 0, len(request.KeyPhrases))
+	for _, p := range request.KeyPhrases {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			keyPhrases = append(keyPhrases, p)
+		}
+	}
+
+	if inventionText == "" && len(keyPhrases) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Provide non-empty 'invention_text' and/or 'key_phrases'"})
 		return
 	}
 
-	relatedPatents, err := services.FindRelatedPatentIDs(c.Request.Context(), inventionText, request.Limit)
+	relatedPatents, err := services.FindRelatedPatentIDs(c.Request.Context(), inventionText, keyPhrases, request.Limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
