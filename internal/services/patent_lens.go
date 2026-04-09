@@ -35,21 +35,26 @@ type lensQueryString struct {
 	Query string `json:"query"`
 }
 
-// fetchLensOrgRelatedPatentIDs searches Lens.org using keyword terms derived from
-// invention text (never raw prose). Returns nil, nil when no keywords are extracted.
-func fetchLensOrgRelatedPatentIDs(ctx context.Context, apiKey, inventionText string, limit int) ([]string, error) {
+// fetchLensOrgRelatedPatentIDs searches Lens.org using keyPhrases joined as the query string.
+// If keyPhrases is empty, falls back to cleaned inventionText (compact prose).
+func fetchLensOrgRelatedPatentIDs(ctx context.Context, apiKey, inventionText string, keyPhrases []string, limit int) ([]string, error) {
 	key := strings.Trim(strings.TrimSpace(apiKey), `"'`)
 	if key == "" {
 		return nil, fmt.Errorf("missing Lens API key")
 	}
 
-	keywords := extractPatentSearchTerms(inventionText)
-	if len(keywords) == 0 {
-		return nil, nil
+	var parts []string
+	for _, kp := range keyPhrases {
+		kp = strings.TrimSpace(kp)
+		if kp != "" {
+			parts = append(parts, kp)
+		}
 	}
-
-	queryStr := strings.Join(keywords, " ")
+	queryStr := strings.Join(parts, " ")
 	if strings.TrimSpace(queryStr) == "" {
+		queryStr = strings.TrimSpace(inventionText)
+	}
+	if queryStr == "" {
 		return nil, nil
 	}
 

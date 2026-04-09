@@ -26,26 +26,47 @@ type serpPatentsOrganicRow struct {
 	PublicationNumber string `json:"publication_number"`
 }
 
-// buildSerpPatentQueries builds compact Google Patents–style queries from invention text.
-// It uses extractPatentSearchTerms (no raw prose). Returns nil if no usable terms exist.
-func buildSerpPatentQueries(inventionText string) []string {
-	terms := extractPatentSearchTerms(inventionText)
-	if len(terms) == 0 {
-		return nil
+// buildSerpPatentQueries builds compact Google Patents–style queries from key phrases.
+// When keyPhrases is empty, falls back to cleaned inventionText truncated to maxInventionRunes.
+func buildSerpPatentQueries(keyPhrases []string, inventionText string) []string {
+	seen := make(map[string]struct{}, len(keyPhrases))
+	terms := make([]string, 0, len(keyPhrases))
+	for _, t := range keyPhrases {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		lk := strings.ToLower(t)
+		if _, ok := seen[lk]; ok {
+			continue
+		}
+		seen[lk] = struct{}{}
+		terms = append(terms, t)
 	}
 
-	seen := make(map[string]struct{}, 8)
+	const maxInventionRunes = 400
+
 	queries := make([]string, 0, 4)
+	seenQ := make(map[string]struct{}, 8)
 	add := func(q string) {
 		q = strings.TrimSpace(q)
 		if q == "" {
 			return
 		}
-		if _, ok := seen[q]; ok {
+		if _, ok := seenQ[q]; ok {
 			return
 		}
-		seen[q] = struct{}{}
+		seenQ[q] = struct{}{}
 		queries = append(queries, q)
+	}
+
+	if len(terms) == 0 {
+		fallback := truncateRunes(inventionText, maxInventionRunes)
+		if fallback == "" {
+			return nil
+		}
+		add(fallback)
+		return queries
 	}
 
 	orGroup := func(ts []string) string {
@@ -80,13 +101,13 @@ func isSerpPatentsNoResultsMessage(msg string) bool {
 		(strings.Contains(m, "google patents") && strings.Contains(m, "no results"))
 }
 
-func fetchSerpAPIRelatedPatentIDs(ctx context.Context, apiKey, inventionText string, limit int) ([]string, error) {
+func fetchSerpAPIRelatedPatentIDs(ctx context.Context, apiKey, inventionText string, keyPhrases []string, limit int) ([]string, error) {
 	key := strings.Trim(strings.TrimSpace(apiKey), `"'`)
 	if key == "" {
 		return nil, fmt.Errorf("missing SerpAPI key")
 	}
 
-	queries := buildSerpPatentQueries(inventionText)
+	queries := buildSerpPatentQueries(keyPhrases, inventionText)
 	if len(queries) == 0 {
 		return nil, nil
 	}
